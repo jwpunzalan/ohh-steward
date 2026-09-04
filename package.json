@@ -1,0 +1,7 @@
+{
+  "name": "ohh-steward",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ]
+}

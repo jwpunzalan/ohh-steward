@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# env files (real values are never committed — see apps/web/.env.example
+# and apps/mobile/.env.example for the documented variable names)
+.env
+.env.local
+.env.*.local
+
+# Expo/EAS local credential files
+.expo/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# OS
+.DS_Store
