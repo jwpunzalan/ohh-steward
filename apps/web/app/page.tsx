@@ -70,6 +70,18 @@ export default function AuthPage() {
           We sent a confirmation link to {email}. Confirm your account, then
           come back and sign in.
         </p>
+
+        <button
+          type="button"
+          onClick={() => {
+            setError(null);
+            setMode("signin");
+            setCheckEmail(false);
+          }}
+          style={{ background: "none", border: "none", textDecoration: "underline", cursor: "pointer", padding: 0 }}
+        >
+          Back to sign in
+        </button>
       </main>
     );
   }
