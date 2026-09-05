@@ -1,22 +1,65 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { AppState } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { Button, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { supabase } from "./lib/supabase";
+import {
+  cacheSessionTimeoutMinutes,
+  getCachedSessionTimeoutMinutes,
+  saveSession,
+  touchActivity,
+} from "./lib/session";
+import {
+  checkIdleAndSignOutIfElapsed,
+  resumeStoredSessionIfAllowed,
+} from "./lib/sessionGate";
+import type { Session } from "@supabase/supabase-js";
 
 type Mode = "signup" | "signin";
 type Screen =
+  | "loading"
   | "auth"
   | "check-email"
+  | "mfa-challenge"
   | "dashboard"
   | "create-budget"
   | "invite-send"
   | "accept-invite"
-  | "account";
+  | "account"
+  | "security";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 
+// After any successful full authentication (signup, password-only signin,
+// or a signin's MFA challenge/verify step), persist the session for future
+// biometric resume, cache the household's idle-timeout value for the next
+// gate check (see lib/session.ts for why this must be cached rather than
+// read live), and record this moment as the last activity.
+async function completeAuthentication(session: Session): Promise<void> {
+  await saveSession(session);
+  await touchActivity();
+
+  const { data: member } = await supabase
+    .from("household_member")
+    .select("household_id")
+    .eq("auth_user_id", session.user.id)
+    .eq("is_deleted", false)
+    .single();
+
+  if (member) {
+    const { data: household } = await supabase
+      .from("household")
+      .select("session_timeout_minutes")
+      .eq("id", member.household_id)
+      .single();
+    if (household) {
+      await cacheSessionTimeoutMinutes(household.session_timeout_minutes);
+    }
+  }
+}
+
 export default function App() {
-  const [screen, setScreen] = useState<Screen>("auth");
+  const [screen, setScreen] = useState<Screen>("loading");
   const [mode, setMode] = useState<Mode>("signup");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -30,6 +73,50 @@ export default function App() {
   const [acceptToken, setAcceptToken] = useState("");
   const [acceptEmail, setAcceptEmail] = useState("");
   const [acceptPassword, setAcceptPassword] = useState("");
+  const [mfaFactorId, setMfaFactorId] = useState("");
+  const [mfaChallengeId, setMfaChallengeId] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  const [enrollFactorId, setEnrollFactorId] = useState("");
+  const [enrollQrCode, setEnrollQrCode] = useState("");
+  const [enrollSecret, setEnrollSecret] = useState("");
+  const [enrollCode, setEnrollCode] = useState("");
+  const [enrollDone, setEnrollDone] = useState(false);
+
+  // Cold start: the in-memory Supabase client has no session yet
+  // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
+  // biometric gate (AC5) before ever deciding whether to resume one.
+  useEffect(() => {
+    (async () => {
+      const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+      const result = await resumeStoredSessionIfAllowed(timeoutMinutes);
+      setScreen(result === "resumed" ? "dashboard" : "auth");
+    })();
+  }, []);
+
+  // App was only backgrounded (still has a live in-memory session) — only
+  // the idle check applies here, never the biometric gate (see
+  // checkIdleAndSignOutIfElapsed's own comment).
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", async (next) => {
+      if (next === "active") {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        if (session) {
+          const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+          const result = await checkIdleAndSignOutIfElapsed(timeoutMinutes);
+          if (result === "signed-out") {
+            setScreen("auth");
+          } else {
+            await touchActivity();
+          }
+        }
+      } else {
+        await touchActivity();
+      }
+    });
+    return () => subscription.remove();
+  }, []);
 
   async function handleSubmit() {
     setSubmitting(true);
@@ -55,30 +142,151 @@ export default function App() {
         return;
       }
 
+      // Mandatory email confirmation (this project's actual configuration)
+      // means signUp() returns session: null until the user confirms — not
+      // an error. completeAuthentication() (session caching, biometric
+      // storage) only makes sense once a session actually exists, so it
+      // must never run on this branch.
       if (!data.session) {
         setSubmitting(false);
         setScreen("check-email");
         return;
       }
+
+      await completeAuthentication(data.session);
     } else {
-      const { error: signInError } = await supabase.auth.signInWithPassword({
+      // AC1: any device with no valid stored session always goes through
+      // the full flow — password, then MFA challenge if the user has 2FA
+      // enrolled — never a shortcut.
+      const { data, error: signInError } = await supabase.auth.signInWithPassword({
         email,
         password,
       });
-      if (signInError) {
+      if (signInError || !data.session) {
         setError("Invalid email or password.");
         setSubmitting(false);
         return;
       }
+
+      const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+      if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
+        const { data: factors, error: factorsError } =
+          await supabase.auth.mfa.listFactors();
+        const factor = factors?.totp?.[0];
+        if (factorsError || !factor) {
+          setError("We couldn't complete sign-in. Please try again.");
+          setSubmitting(false);
+          return;
+        }
+        const { data: challenge, error: challengeError } =
+          await supabase.auth.mfa.challenge({ factorId: factor.id });
+        if (challengeError || !challenge) {
+          setError("We couldn't complete sign-in. Please try again.");
+          setSubmitting(false);
+          return;
+        }
+        setMfaFactorId(factor.id);
+        setMfaChallengeId(challenge.id);
+        setSubmitting(false);
+        setScreen("mfa-challenge");
+        return;
+      }
+
+      await completeAuthentication(data.session);
     }
 
     setSubmitting(false);
     setScreen("dashboard");
   }
 
+  async function handleVerifyMfa() {
+    setSubmitting(true);
+    setError(null);
+
+    const { data, error: verifyError } = await supabase.auth.mfa.verify({
+      factorId: mfaFactorId,
+      challengeId: mfaChallengeId,
+      code: mfaCode,
+    });
+
+    if (verifyError || !data) {
+      setError("Invalid code. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    // mfa.verify() returns the new session as flat fields, not a nested
+    // `session` object — structurally the same shape completeAuthentication
+    // needs (access_token/refresh_token/user), just reassembled here.
+    await completeAuthentication({
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_in: data.expires_in,
+      token_type: data.token_type,
+      user: data.user,
+    } as Session);
+    setMfaCode("");
+    setSubmitting(false);
+    setScreen("dashboard");
+  }
+
+  async function handleStartEnrollment() {
+    setSubmitting(true);
+    setError(null);
+    setEnrollDone(false);
+
+    const { data, error: enrollError } = await supabase.auth.mfa.enroll({
+      factorType: "totp",
+    });
+
+    if (enrollError || !data) {
+      setError("We couldn't start 2FA enrollment. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setEnrollFactorId(data.id);
+    setEnrollQrCode(data.totp.qr_code);
+    setEnrollSecret(data.totp.secret);
+    setSubmitting(false);
+  }
+
+  async function handleConfirmEnrollment() {
+    setSubmitting(true);
+    setError(null);
+
+    const { data: challenge, error: challengeError } =
+      await supabase.auth.mfa.challenge({ factorId: enrollFactorId });
+    if (challengeError || !challenge) {
+      setError("We couldn't confirm 2FA enrollment. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    const { error: verifyError } = await supabase.auth.mfa.verify({
+      factorId: enrollFactorId,
+      challengeId: challenge.id,
+      code: enrollCode,
+    });
+
+    if (verifyError) {
+      setError("Invalid code. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    setEnrollDone(true);
+    setEnrollCode("");
+    setEnrollQrCode("");
+    setEnrollSecret("");
+    setEnrollFactorId("");
+  }
+
   async function handleCreateBudget() {
     setSubmitting(true);
     setError(null);
+    await touchActivity();
 
     const {
       data: { user },
@@ -128,6 +336,7 @@ export default function App() {
     setSubmitting(true);
     setError(null);
     setInviteSent(false);
+    await touchActivity();
 
     const { error: inviteError } = await supabase.rpc("rpc_create_invite", {
       p_email: inviteEmail,
@@ -168,6 +377,7 @@ export default function App() {
       access_token: data.session.access_token,
       refresh_token: data.session.refresh_token,
     });
+    await completeAuthentication(data.session);
 
     setSubmitting(false);
     setAcceptToken("");
@@ -179,6 +389,7 @@ export default function App() {
   async function handleDeleteAccount() {
     setSubmitting(true);
     setError(null);
+    await touchActivity();
 
     const { error: invokeError } = await supabase.functions.invoke(
       "delete-own-account",
@@ -220,6 +431,76 @@ export default function App() {
           }}
         >
           <Text style={styles.link}>Back to sign in</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
+  if (screen === "loading") {
+    return (
+      <View style={styles.container}>
+        <Text>Loading…</Text>
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
+  if (screen === "security") {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Security</Text>
+
+        {enrollDone && <Text>Two-factor authentication is now enabled.</Text>}
+
+        {!enrollQrCode && !enrollDone && (
+          <Button
+            title={submitting ? "Starting…" : "Enable 2FA"}
+            onPress={handleStartEnrollment}
+            disabled={submitting}
+          />
+        )}
+
+        {enrollQrCode && (
+          <>
+            {/* mfa.enroll() also returns totp.qr_code as inline SVG markup,
+                which React Native's Image component cannot render without an
+                SVG-rendering dependency not named in this DIP (Obligation 11)
+                — the manual-entry secret below is the standard, always-
+                available alternative every authenticator app already
+                supports, so it's used here as the primary path rather than
+                adding a new dependency for the QR image alone. */}
+            <Text>Enter this code in your authenticator app:</Text>
+            <Text selectable style={styles.secret}>
+              {enrollSecret}
+            </Text>
+
+            <TextInput
+              style={styles.input}
+              placeholder="6-digit code"
+              value={enrollCode}
+              onChangeText={setEnrollCode}
+              keyboardType="number-pad"
+            />
+
+            <Button
+              title={submitting ? "Confirming…" : "Confirm"}
+              onPress={handleConfirmEnrollment}
+              disabled={submitting}
+            />
+          </>
+        )}
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Pressable
+          onPress={() => {
+            setError(null);
+            setScreen("dashboard");
+          }}
+        >
+          <Text style={styles.link}>Back to dashboard</Text>
         </Pressable>
 
         <StatusBar style="auto" />
@@ -413,6 +694,39 @@ export default function App() {
             setScreen("account");
           }}
         />
+        <Button
+          title="Security"
+          onPress={() => {
+            setError(null);
+            setScreen("security");
+          }}
+        />
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
+  if (screen === "mfa-challenge") {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Enter your 2FA code</Text>
+
+        <TextInput
+          style={styles.input}
+          placeholder="6-digit code"
+          value={mfaCode}
+          onChangeText={setMfaCode}
+          keyboardType="number-pad"
+        />
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Verifying…" : "Verify"}
+          onPress={handleVerifyMfa}
+          disabled={submitting}
+        />
+
         <StatusBar style="auto" />
       </View>
     );
@@ -506,5 +820,9 @@ const styles = StyleSheet.create({
   link: {
     marginTop: 12,
     textDecorationLine: "underline",
+  },
+  secret: {
+    fontFamily: "monospace",
+    fontSize: 12,
   },
 });
