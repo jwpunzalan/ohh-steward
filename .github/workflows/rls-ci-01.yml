@@ -2,7 +2,11 @@ name: RLS-CI-01
 
 # Hard gate per DIP-2.1 (Implementation Instructions item 9 / Deployment
 # Instructions item 2): runs the tenant-isolation regression suite against an
-# ephemeral local Supabase CLI stack on every schema/policy change. Never
+# ephemeral local Supabase CLI stack. Configured as a required branch-
+# protection status check on dev and main, so it runs on every PR regardless
+# of which files changed (no path filter) — a required check that never
+# reports on some PRs would leave those PRs permanently blocked, since GitHub
+# treats a required check that never runs as pending, not passed. Never
 # targets a real Preview/Production project — see Secure Coding obligation 4
 # note below.
 on:
@@ -10,12 +14,6 @@ on:
     branches:
       - dev
       - main
-    paths:
-      - "supabase/migrations/**"
-      - "tests/rls/**"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/rls-ci-01.yml"
   workflow_dispatch: {}
 
 permissions:
