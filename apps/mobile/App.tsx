@@ -211,6 +211,17 @@ export default function App() {
           We sent a confirmation link to {email}. Confirm your account, then
           come back and sign in.
         </Text>
+
+        <Pressable
+          onPress={() => {
+            setError(null);
+            setMode("signin");
+            setScreen("auth");
+          }}
+        >
+          <Text style={styles.link}>Back to sign in</Text>
+        </Pressable>
+
         <StatusBar style="auto" />
       </View>
     );
