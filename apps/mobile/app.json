@@ -7,7 +7,10 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "Allow OHh Steward to use Face ID to quickly unlock your session."
+      }
     },
     "android": {
       "adaptiveIcon": {
