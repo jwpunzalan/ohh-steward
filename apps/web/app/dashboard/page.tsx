@@ -11,6 +11,8 @@ export default function DashboardPage() {
       <Link href="/dashboard/budgets/new">Create a budget</Link>
       <br />
       <Link href="/dashboard/invites/new">Invite someone to your household</Link>
+      <br />
+      <Link href="/dashboard/account">Account</Link>
     </main>
   );
 }
