@@ -13,6 +13,7 @@ export default function AuthPage() {
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [checkEmail, setCheckEmail] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -22,7 +23,14 @@ export default function AuthPage() {
     const supabase = createClient();
 
     if (mode === "signup") {
-      const { error: signUpError } = await supabase.auth.signUp({
+      // Household bootstrap happens server-side via a database trigger on
+      // auth.users (Story 1.1.G2) — unconditionally, at account-creation
+      // time, regardless of whether email confirmation is required. No
+      // client-side bootstrap call exists: under mandatory email
+      // confirmation (this project's actual configuration), signUp()
+      // returns session: null until the user confirms, so any call
+      // requiring an authenticated session would run as anon and fail.
+      const { data, error: signUpError } = await supabase.auth.signUp({
         email,
         password,
       });
@@ -34,14 +42,9 @@ export default function AuthPage() {
         return;
       }
 
-      const { error: bootstrapError } = await supabase.rpc(
-        "rpc_bootstrap_household",
-      );
-      if (bootstrapError) {
-        setError(
-          "We couldn't finish setting up your household. Please try again.",
-        );
+      if (!data.session) {
         setSubmitting(false);
+        setCheckEmail(true);
         return;
       }
     } else {
@@ -57,6 +60,18 @@ export default function AuthPage() {
     }
 
     router.push("/dashboard");
+  }
+
+  if (checkEmail) {
+    return (
+      <main style={{ maxWidth: 360, margin: "4rem auto", padding: "0 1rem" }}>
+        <h1>Check your email</h1>
+        <p>
+          We sent a confirmation link to {email}. Confirm your account, then
+          come back and sign in.
+        </p>
+      </main>
+    );
   }
 
   return (
