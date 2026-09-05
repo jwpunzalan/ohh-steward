@@ -4,8 +4,14 @@ import { Button, Pressable, StyleSheet, Text, TextInput, View } from "react-nati
 import { supabase } from "./lib/supabase";
 
 type Mode = "signup" | "signin";
-type Screen = "auth" | "dashboard" | "create-budget";
+type Screen =
+  | "auth"
+  | "dashboard"
+  | "create-budget"
+  | "invite-send"
+  | "accept-invite";
 type PeriodType = "monthly" | "biweekly";
+type InviteRole = "parent" | "member";
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("auth");
@@ -16,6 +22,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [budgetName, setBudgetName] = useState("");
   const [periodType, setPeriodType] = useState<PeriodType>("monthly");
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<InviteRole>("member");
+  const [inviteSent, setInviteSent] = useState(false);
+  const [acceptToken, setAcceptToken] = useState("");
+  const [acceptEmail, setAcceptEmail] = useState("");
+  const [acceptPassword, setAcceptPassword] = useState("");
 
   async function handleSubmit() {
     setSubmitting(true);
@@ -108,6 +120,150 @@ export default function App() {
     setScreen("dashboard");
   }
 
+  async function handleSendInvite() {
+    setSubmitting(true);
+    setError(null);
+    setInviteSent(false);
+
+    const { error: inviteError } = await supabase.rpc("rpc_create_invite", {
+      p_email: inviteEmail,
+      p_role: inviteRole,
+    });
+
+    if (inviteError) {
+      // Never surface raw Supabase/Postgres error text (Secure Coding
+      // obligation 10) — e.g. "not authorized" or "member cap reached".
+      setError("We couldn't send that invite. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    setInviteSent(true);
+    setInviteEmail("");
+  }
+
+  async function handleAcceptInvite() {
+    setSubmitting(true);
+    setError(null);
+
+    const { data, error: invokeError } = await supabase.functions.invoke(
+      "accept-invite",
+      { body: { token: acceptToken, email: acceptEmail, password: acceptPassword } },
+    );
+
+    if (invokeError || !data?.session) {
+      // Uniform generic message regardless of which internal condition
+      // failed (AC6) — never surface raw error text (obligation 10).
+      setError("This invite is invalid or has expired.");
+      setSubmitting(false);
+      return;
+    }
+
+    await supabase.auth.setSession({
+      access_token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+    });
+
+    setSubmitting(false);
+    setAcceptToken("");
+    setAcceptEmail("");
+    setAcceptPassword("");
+    setScreen("dashboard");
+  }
+
+  if (screen === "accept-invite") {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Accept your invite</Text>
+        <Text>Enter the details from your invite email.</Text>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Email"
+          value={acceptEmail}
+          onChangeText={setAcceptEmail}
+          autoCapitalize="none"
+          keyboardType="email-address"
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Invite token"
+          value={acceptToken}
+          onChangeText={setAcceptToken}
+          autoCapitalize="none"
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Choose a password"
+          value={acceptPassword}
+          onChangeText={setAcceptPassword}
+          secureTextEntry
+          textContentType="newPassword"
+        />
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Please wait…" : "Join household"}
+          onPress={handleAcceptInvite}
+          disabled={submitting}
+        />
+
+        <Pressable
+          onPress={() => {
+            setError(null);
+            setScreen("auth");
+          }}
+        >
+          <Text style={styles.link}>Cancel</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
+  if (screen === "invite-send") {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Invite someone to your household</Text>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Email"
+          value={inviteEmail}
+          onChangeText={setInviteEmail}
+          autoCapitalize="none"
+          keyboardType="email-address"
+        />
+
+        <Pressable
+          onPress={() =>
+            setInviteRole(inviteRole === "member" ? "parent" : "member")
+          }
+        >
+          <Text style={styles.link}>Role: {inviteRole} (tap to change)</Text>
+        </Pressable>
+
+        {error && <Text style={styles.error}>{error}</Text>}
+        {inviteSent && <Text>Invite sent.</Text>}
+
+        <Button
+          title={submitting ? "Sending…" : "Send invite"}
+          onPress={handleSendInvite}
+          disabled={submitting}
+        />
+
+        <Pressable onPress={() => setScreen("dashboard")}>
+          <Text style={styles.link}>Back to dashboard</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
   if (screen === "create-budget") {
     return (
       <View style={styles.container}>
@@ -160,6 +316,14 @@ export default function App() {
             setScreen("create-budget");
           }}
         />
+        <Button
+          title="Invite someone to your household"
+          onPress={() => {
+            setError(null);
+            setInviteSent(false);
+            setScreen("invite-send");
+          }}
+        />
         <StatusBar style="auto" />
       </View>
     );
@@ -210,6 +374,15 @@ export default function App() {
             ? "Already have an account? Sign in"
             : "Need an account? Sign up"}
         </Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => {
+          setError(null);
+          setScreen("accept-invite");
+        }}
+      >
+        <Text style={styles.link}>Have an invite? Accept it here</Text>
       </Pressable>
 
       <StatusBar style="auto" />
