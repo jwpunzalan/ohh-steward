@@ -368,6 +368,22 @@ deno_version = 2
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 
+[functions.send-invite-email]
+enabled = true
+verify_jwt = true
+import_map = "./functions/send-invite-email/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+# entrypoint = "./functions/send-invite-email/index.ts"
+
+[functions.accept-invite]
+enabled = true
+verify_jwt = true
+import_map = "./functions/accept-invite/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+# entrypoint = "./functions/accept-invite/index.ts"
+
 [analytics]
 enabled = true
 port = 54327

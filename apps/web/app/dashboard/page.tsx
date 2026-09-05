@@ -9,6 +9,8 @@ export default function DashboardPage() {
         placeholder — later stories will build the real dashboard here.
       </p>
       <Link href="/dashboard/budgets/new">Create a budget</Link>
+      <br />
+      <Link href="/dashboard/invites/new">Invite someone to your household</Link>
     </main>
   );
 }
