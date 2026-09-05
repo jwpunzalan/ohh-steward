@@ -99,24 +99,35 @@ describe("RLS-CI-01: budget tenant isolation", () => {
     memberB = await signInClient(memberBEmail);
     memberC = await signInClient(memberCEmail);
 
-    // Parent A bootstraps a fresh household via the real Story 1.1 RPC.
-    const { data: bootstrappedHouseholdId, error: bootstrapErr } =
-      await parentA.rpc("rpc_bootstrap_household");
-    if (bootstrapErr) throw bootstrapErr;
-    householdId = bootstrappedHouseholdId as string;
-
-    // Member B and C join the SAME household. There is no invite RPC yet
-    // (Story 1.2), so this uses the service_role client to insert directly,
-    // bypassing RLS — this is test fixture setup, not part of what the
-    // suite below is asserting.
-    const { data: memberRows, error: memberInsertErr } = await admin
+    // Since Story 1.1.G2, every auth.users insert (including the
+    // admin.createUser() calls above) is bootstrapped into its own new
+    // household by the trg_bootstrap_household_on_signup trigger,
+    // unconditionally — rpc_bootstrap_household() is no longer
+    // client-callable at all (authenticated's EXECUTE grant is revoked) and
+    // is redundant here regardless, since the trigger already did the work.
+    // Parent A's household is simply whatever the trigger already created.
+    const { data: parentAMember, error: parentAMemberErr } = await admin
       .from("household_member")
-      .insert([
-        { household_id: householdId, auth_user_id: memberBId, role: "member" },
-        { household_id: householdId, auth_user_id: memberCId, role: "member" },
-      ])
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (parentAMemberErr) throw parentAMemberErr;
+    householdId = parentAMember.household_id as string;
+
+    // Member B and C each also got their own self-bootstrapped household
+    // from the same trigger — reassign their existing row into Parent A's
+    // household instead of inserting a new one (a fresh insert would
+    // collide with uq_household_member_active_user, since they already have
+    // an active row from the trigger). There is no invite RPC flow exercised
+    // here (Story 1.2); this uses the service_role client to update
+    // directly, bypassing RLS — test fixture setup, not part of what the
+    // suite below is asserting.
+    const { data: memberRows, error: memberUpdateErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdId, role: "member" })
+      .in("auth_user_id", [memberBId, memberCId])
       .select("id, auth_user_id");
-    if (memberInsertErr) throw memberInsertErr;
+    if (memberUpdateErr) throw memberUpdateErr;
 
     const memberBRow = memberRows!.find((r) => r.auth_user_id === memberBId)!;
     const memberCRow = memberRows!.find((r) => r.auth_user_id === memberCId)!;

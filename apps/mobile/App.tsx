@@ -6,6 +6,7 @@ import { supabase } from "./lib/supabase";
 type Mode = "signup" | "signin";
 type Screen =
   | "auth"
+  | "check-email"
   | "dashboard"
   | "create-budget"
   | "invite-send"
@@ -35,7 +36,14 @@ export default function App() {
     setError(null);
 
     if (mode === "signup") {
-      const { error: signUpError } = await supabase.auth.signUp({
+      // Household bootstrap happens server-side via a database trigger on
+      // auth.users (Story 1.1.G2) — unconditionally, at account-creation
+      // time, regardless of whether email confirmation is required. No
+      // client-side bootstrap call exists: under mandatory email
+      // confirmation (this project's actual configuration), signUp()
+      // returns session: null until the user confirms, so any call
+      // requiring an authenticated session would run as anon and fail.
+      const { data, error: signUpError } = await supabase.auth.signUp({
         email,
         password,
       });
@@ -47,14 +55,9 @@ export default function App() {
         return;
       }
 
-      const { error: bootstrapError } = await supabase.rpc(
-        "rpc_bootstrap_household",
-      );
-      if (bootstrapError) {
-        setError(
-          "We couldn't finish setting up your household. Please try again.",
-        );
+      if (!data.session) {
         setSubmitting(false);
+        setScreen("check-email");
         return;
       }
     } else {
@@ -198,6 +201,19 @@ export default function App() {
     setSubmitting(false);
     await supabase.auth.signOut();
     setScreen("auth");
+  }
+
+  if (screen === "check-email") {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Check your email</Text>
+        <Text>
+          We sent a confirmation link to {email}. Confirm your account, then
+          come back and sign in.
+        </Text>
+        <StatusBar style="auto" />
+      </View>
+    );
   }
 
   if (screen === "account") {
