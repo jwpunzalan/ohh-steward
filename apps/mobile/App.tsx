@@ -9,7 +9,8 @@ type Screen =
   | "dashboard"
   | "create-budget"
   | "invite-send"
-  | "accept-invite";
+  | "accept-invite"
+  | "account";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 
@@ -172,6 +173,60 @@ export default function App() {
     setScreen("dashboard");
   }
 
+  async function handleDeleteAccount() {
+    setSubmitting(true);
+    setError(null);
+
+    const { error: invokeError } = await supabase.functions.invoke(
+      "delete-own-account",
+      { method: "POST" },
+    );
+
+    if (invokeError) {
+      // The RPC's own exception messages are fixed, non-interpolated
+      // strings safe to show verbatim (Secure Coding obligation 10 — see
+      // this story's Application to this story section) — e.g. the
+      // last-Parent guidance message. A genuinely unexpected failure falls
+      // back to a generic message instead.
+      const context = (invokeError as { context?: Response }).context;
+      const body = await context?.json?.().catch(() => null);
+      setError(body?.error ?? "Something went wrong. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    await supabase.auth.signOut();
+    setScreen("auth");
+  }
+
+  if (screen === "account") {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Account</Text>
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Deleting…" : "Delete my account"}
+          onPress={handleDeleteAccount}
+          disabled={submitting}
+        />
+
+        <Pressable
+          onPress={() => {
+            setError(null);
+            setScreen("dashboard");
+          }}
+        >
+          <Text style={styles.link}>Back to dashboard</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
   if (screen === "accept-invite") {
     return (
       <View style={styles.container}>
@@ -322,6 +377,13 @@ export default function App() {
             setError(null);
             setInviteSent(false);
             setScreen("invite-send");
+          }}
+        />
+        <Button
+          title="Account"
+          onPress={() => {
+            setError(null);
+            setScreen("account");
           }}
         />
         <StatusBar style="auto" />
