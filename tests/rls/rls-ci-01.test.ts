@@ -261,3 +261,262 @@ describe("RLS-CI-01: budget tenant isolation", () => {
     expect(error).not.toBeNull();
   });
 });
+
+/**
+ * DVP.md §3's mandatory RLS-CI-01 coverage list includes "As Member: attempt
+ * Category CRUD — must fail (read-only allowed, write denied)" — this block
+ * closes that gap. It also covers DIP-2.3's own AC5/AC6 negative-security
+ * cases (the RPC-layer + RLS-layer double denial, and the IDOR fix keying
+ * authorization off the target row's actual household rather than any
+ * caller-supplied one) and the soft-delete/idempotency behavior from
+ * AC3/AC4/Obligation 12. Runs as its own describe block with its own
+ * fixtures — Category is household-scoped, not Budget-scoped, and the IDOR
+ * case specifically needs a *second* household the first describe block's
+ * fixtures don't provide.
+ */
+describe("RLS-CI-01: category household-scoped access", () => {
+  const admin = adminClient();
+  const catRunId = `${runId}-cat`;
+
+  let parentAId: string;
+  let memberId: string;
+  let parentBId: string;
+  let householdAId: string;
+  let householdBId: string;
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+  let parentB: SupabaseClient;
+
+  let categoryAId: string; // belongs to household A
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${catRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${catRunId}-member@example.com`;
+    const parentBEmail = `rls-ci-01-${catRunId}-parent-b@example.com`;
+
+    const { data: parentAUser, error: parentAErr } =
+      await admin.auth.admin.createUser({
+        email: parentAEmail,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+    if (parentAErr) throw parentAErr;
+    parentAId = parentAUser.user.id;
+
+    const { data: memberUser, error: memberErr } =
+      await admin.auth.admin.createUser({
+        email: memberEmail,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+    if (memberErr) throw memberErr;
+    memberId = memberUser.user.id;
+
+    const { data: parentBUser, error: parentBErr } =
+      await admin.auth.admin.createUser({
+        email: parentBEmail,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+    if (parentBErr) throw parentBErr;
+    parentBId = parentBUser.user.id;
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+    parentB = await signInClient(parentBEmail);
+
+    // Every auth.users insert is self-bootstrapped into its own household
+    // by the trg_bootstrap_household_on_signup trigger (Story 1.1.G2).
+    // Parent A's and Parent B's households are simply whatever the trigger
+    // already created for each — exactly what this test needs (two
+    // independent households). The member is reassigned into Parent A's
+    // household (a fresh insert would collide with
+    // uq_household_member_active_user, since the trigger already gave them
+    // an active row) — service_role, bypassing RLS; test fixture setup, not
+    // part of what the suite below is asserting.
+    const { data: parentAMember, error: parentAMemberErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (parentAMemberErr) throw parentAMemberErr;
+    householdAId = parentAMember.household_id as string;
+
+    const { data: parentBMember, error: parentBMemberErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentBId)
+      .single();
+    if (parentBMemberErr) throw parentBMemberErr;
+    householdBId = parentBMember.household_id as string;
+
+    const { error: memberUpdateErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId);
+    if (memberUpdateErr) throw memberUpdateErr;
+
+    // A real category in household A, created the only sanctioned way.
+    const { data: categoryA, error: categoryAErr } = await parentA.rpc(
+      "rpc_upsert_category",
+      { p_household_id: householdAId, p_name: "RLS-CI-01 Category A" },
+    );
+    if (categoryAErr) throw categoryAErr;
+    categoryAId = categoryA as string;
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId, parentBId]) {
+      if (id) {
+        await admin.auth.admin.deleteUser(id).catch(() => {});
+      }
+    }
+  });
+
+  it("Member can read Category (read-only allowed, per DVP §3)", async () => {
+    const { data, error } = await member.from("category").select("id, name");
+    expect(error).toBeNull();
+    expect((data ?? []).map((r) => r.id)).toContain(categoryAId);
+  });
+
+  it("Member cannot create a Category via the RPC (write denied)", async () => {
+    const { error } = await member.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: "Member-created Category",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("Member cannot create a Category via a direct insert (RLS layer, independent of the RPC)", async () => {
+    const { error } = await member
+      .from("category")
+      .insert({ household_id: householdAId, name: "Direct Insert" });
+    expect(error).not.toBeNull();
+  });
+
+  it("Member cannot edit a Category via the RPC (write denied)", async () => {
+    const { error } = await member.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: "hijacked",
+      p_id: categoryAId,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("Member cannot edit a Category via a direct update (RLS layer, independent of the RPC)", async () => {
+    // RLS filters the row out of the UPDATE's target set entirely — this
+    // surfaces as zero rows affected, not a thrown error (same pattern as
+    // the Budget RLS tests above).
+    const { data, error } = await member
+      .from("category")
+      .update({ name: "hijacked" })
+      .eq("id", categoryAId)
+      .select();
+    expect(error).toBeNull();
+    expect(data ?? []).toHaveLength(0);
+  });
+
+  it("Member cannot delete a Category via the RPC (write denied)", async () => {
+    const { error } = await member.rpc("rpc_delete_category", {
+      p_id: categoryAId,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("AC6: a Parent cannot use their own authorized p_household_id to rename another household's Category (IDOR)", async () => {
+    // Parent B creates a category in their own household.
+    const { data: categoryB, error: categoryBErr } = await parentB.rpc(
+      "rpc_upsert_category",
+      { p_household_id: householdBId, p_name: "RLS-CI-01 Category B" },
+    );
+    if (categoryBErr) throw categoryBErr;
+
+    // Parent A supplies their OWN authorized household_id, but the id of a
+    // category that actually belongs to household B. Authorization must be
+    // checked against B (the category's real household), not A (the
+    // caller-supplied one) — the core fix in DIP-2.3-v2.
+    const { error } = await parentA.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: "Renamed by attacker",
+      p_id: categoryB as string,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: unchanged } = await admin
+      .from("category")
+      .select("name")
+      .eq("id", categoryB as string)
+      .single();
+    expect(unchanged?.name).toBe("RLS-CI-01 Category B");
+  });
+
+  it("rejects a mismatched p_household_id even for a Parent's own Category", async () => {
+    // Parent A owns categoryAId, so is_household_parent(householdAId)
+    // passes — but supplying householdBId (a household Parent A does not
+    // control) as p_household_id must still be rejected as an attempted
+    // cross-household move, independent of the ownership check above.
+    const { error } = await parentA.rpc("rpc_upsert_category", {
+      p_household_id: householdBId,
+      p_name: "Trying to move households",
+      p_id: categoryAId,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: unchanged } = await admin
+      .from("category")
+      .select("name, household_id")
+      .eq("id", categoryAId)
+      .single();
+    expect(unchanged?.name).toBe("RLS-CI-01 Category A");
+    expect(unchanged?.household_id).toBe(householdAId);
+  });
+
+  it("soft-delete preserves the label, sets is_deleted, and is excluded from an active-only query", async () => {
+    const { data: toDelete, error: createErr } = await parentA.rpc(
+      "rpc_upsert_category",
+      { p_household_id: householdAId, p_name: "To Be Deleted" },
+    );
+    if (createErr) throw createErr;
+
+    const { error: deleteErr } = await parentA.rpc("rpc_delete_category", {
+      p_id: toDelete as string,
+    });
+    expect(deleteErr).toBeNull();
+
+    const { data: row } = await admin
+      .from("category")
+      .select("name, is_deleted")
+      .eq("id", toDelete as string)
+      .single();
+    expect(row?.name).toBe("To Be Deleted");
+    expect(row?.is_deleted).toBe(true);
+
+    const { data: activeOnly } = await admin
+      .from("category")
+      .select("id")
+      .eq("household_id", householdAId)
+      .eq("is_deleted", false);
+    expect((activeOnly ?? []).map((r) => r.id)).not.toContain(toDelete);
+  });
+
+  it("double-delete raises rather than silently succeeding as a no-op", async () => {
+    const { data: toDelete, error: createErr } = await parentA.rpc(
+      "rpc_upsert_category",
+      { p_household_id: householdAId, p_name: "Deleted Twice" },
+    );
+    if (createErr) throw createErr;
+
+    const { error: firstDeleteErr } = await parentA.rpc(
+      "rpc_delete_category",
+      { p_id: toDelete as string },
+    );
+    expect(firstDeleteErr).toBeNull();
+
+    const { error: secondDeleteErr } = await parentA.rpc(
+      "rpc_delete_category",
+      { p_id: toDelete as string },
+    );
+    expect(secondDeleteErr).not.toBeNull();
+  });
+});
