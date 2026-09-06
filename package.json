@@ -6,7 +6,8 @@
     "apps/*"
   ],
   "scripts": {
-    "test:rls": "vitest run tests/rls"
+    "test:rls": "vitest run tests/rls",
+    "test:db": "vitest run tests/db"
   },
   "devDependencies": {
     "@supabase/supabase-js": "2.115.0",

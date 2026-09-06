@@ -9,6 +9,15 @@ name: RLS-CI-01
 # treats a required check that never runs as pending, not passed. Never
 # targets a real Preview/Production project — see Secure Coding obligation 4
 # note below.
+#
+# Also runs Story 2.4's schema-constraint suite (tests/db) in the same job.
+# Not part of DIP-2.4's own literal instructions, but added deliberately so
+# that suite is continuously enforced rather than a file nobody re-runs after
+# it's first written — the same required check, same ephemeral stack, no new
+# branch-protection setup needed. Kept in a separate job step (not merged
+# into "Run RLS-CI-01") and a separate npm script (`test:db`, not `test:rls`)
+# since it isn't a tenant-isolation test — see tests/db/currency.test.ts's
+# own docstring for why it's deliberately not in tests/rls/.
 on:
   pull_request:
     branches:
@@ -55,6 +64,9 @@ jobs:
 
       - name: Run RLS-CI-01
         run: npm run test:rls
+
+      - name: Run Story 2.4 schema-constraint tests
+        run: npm run test:db
 
       - name: Stop local Supabase stack
         if: always()
