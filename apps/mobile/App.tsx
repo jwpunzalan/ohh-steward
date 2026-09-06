@@ -26,9 +26,12 @@ type Screen =
   | "invite-send"
   | "accept-invite"
   | "account"
-  | "security";
+  | "security"
+  | "create-account";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
+type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
+type Budget = { id: string; name: string };
 
 // After any successful full authentication (signup, password-only signin,
 // or a signin's MFA challenge/verify step), persist the session for future
@@ -81,6 +84,14 @@ export default function App() {
   const [enrollSecret, setEnrollSecret] = useState("");
   const [enrollCode, setEnrollCode] = useState("");
   const [enrollDone, setEnrollDone] = useState(false);
+  const [accountBudgets, setAccountBudgets] = useState<Budget[]>([]);
+  const [accountBudgetId, setAccountBudgetId] = useState("");
+  const [accountType, setAccountType] = useState<AccountType>("account");
+  const [accountName, setAccountName] = useState("");
+  const [accountCurrency, setAccountCurrency] = useState("USD");
+  const [accountOpeningBalance, setAccountOpeningBalance] = useState("0");
+  const [accountTargetAmount, setAccountTargetAmount] = useState("");
+  const [accountCreditLimit, setAccountCreditLimit] = useState("");
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -329,6 +340,49 @@ export default function App() {
 
     setSubmitting(false);
     setBudgetName("");
+    setScreen("dashboard");
+  }
+
+  async function loadAccountBudgets() {
+    const { data } = await supabase.from("budget").select("id, name");
+    if (data) {
+      setAccountBudgets(data);
+      if (data[0]) setAccountBudgetId(data[0].id);
+    }
+  }
+
+  async function handleCreateAccount() {
+    setSubmitting(true);
+    setError(null);
+    await touchActivity();
+
+    const { error: createError } = await supabase.rpc("rpc_create_account", {
+      p_budget_id: accountBudgetId,
+      p_type: accountType,
+      p_name: accountName,
+      p_currency: accountCurrency,
+      p_opening_balance: Number(accountOpeningBalance) || 0,
+      p_target_amount:
+        accountType === "savings_goal" && accountTargetAmount
+          ? Number(accountTargetAmount)
+          : null,
+      p_credit_limit:
+        accountType === "credit_card" && accountCreditLimit
+          ? Number(accountCreditLimit)
+          : null,
+    });
+
+    if (createError) {
+      // Never surface raw Supabase/Postgres error text (Secure Coding
+      // obligation 10) — e.g. "not authorized for this budget" or a
+      // type/field-mismatch rejection.
+      setError("We couldn't create that account. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    setAccountName("");
     setScreen("dashboard");
   }
 
@@ -627,6 +681,110 @@ export default function App() {
     );
   }
 
+  if (screen === "create-account") {
+    const accountTypes: AccountType[] = [
+      "account",
+      "savings",
+      "savings_goal",
+      "credit_card",
+    ];
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Add an account</Text>
+
+        <Pressable
+          onPress={() => {
+            const next =
+              accountBudgets[
+                (accountBudgets.findIndex((b) => b.id === accountBudgetId) + 1) %
+                  accountBudgets.length
+              ];
+            if (next) setAccountBudgetId(next.id);
+          }}
+        >
+          <Text style={styles.link}>
+            Budget:{" "}
+            {accountBudgets.find((b) => b.id === accountBudgetId)?.name ??
+              "none"}{" "}
+            (tap to change)
+          </Text>
+        </Pressable>
+
+        <Pressable
+          onPress={() =>
+            setAccountType(
+              accountTypes[
+                (accountTypes.indexOf(accountType) + 1) % accountTypes.length
+              ],
+            )
+          }
+        >
+          <Text style={styles.link}>Type: {accountType} (tap to change)</Text>
+        </Pressable>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Name"
+          value={accountName}
+          onChangeText={setAccountName}
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Currency"
+          value={accountCurrency}
+          onChangeText={(text) => setAccountCurrency(text.toUpperCase())}
+          maxLength={3}
+          autoCapitalize="characters"
+        />
+        <TextInput
+          style={styles.input}
+          placeholder={
+            accountType === "credit_card"
+              ? "Current balance owed"
+              : "Opening balance"
+          }
+          value={accountOpeningBalance}
+          onChangeText={setAccountOpeningBalance}
+          keyboardType="numeric"
+        />
+
+        {accountType === "savings_goal" && (
+          <TextInput
+            style={styles.input}
+            placeholder="Target amount"
+            value={accountTargetAmount}
+            onChangeText={setAccountTargetAmount}
+            keyboardType="numeric"
+          />
+        )}
+
+        {accountType === "credit_card" && (
+          <TextInput
+            style={styles.input}
+            placeholder="Credit limit"
+            value={accountCreditLimit}
+            onChangeText={setAccountCreditLimit}
+            keyboardType="numeric"
+          />
+        )}
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Creating…" : "Create account"}
+          onPress={handleCreateAccount}
+          disabled={submitting || !accountBudgetId}
+        />
+
+        <Pressable onPress={() => setScreen("dashboard")}>
+          <Text style={styles.link}>Cancel</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
   if (screen === "create-budget") {
     return (
       <View style={styles.container}>
@@ -677,6 +835,14 @@ export default function App() {
           onPress={() => {
             setError(null);
             setScreen("create-budget");
+          }}
+        />
+        <Button
+          title="Add an account"
+          onPress={async () => {
+            setError(null);
+            await loadAccountBudgets();
+            setScreen("create-account");
           }}
         />
         <Button
