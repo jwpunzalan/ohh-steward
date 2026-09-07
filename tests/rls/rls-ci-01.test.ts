@@ -1441,3 +1441,296 @@ describe("RLS-CI-01: transaction split sum validation and retroactive splitting"
     expect(error).not.toBeNull();
   });
 });
+
+/**
+ * DIP-5.1 (Story 5.1) — budget_period / category_limit RLS + write-path
+ * coverage. The DIP's Grounding Check (Convention 5) commits to this
+ * describe block per IMPLEMENTATION_CONVENTIONS item 5 (RLS-CI-01 cross-check
+ * against DVP §3 is a committed deliverable, never deferred); the block spec
+ * itself was omitted from the DIP body, so it is written here to the
+ * Grounding Check's stated shape. Covers: SELECT isolation on both new
+ * tables, the deliberate absence of any client write policy on budget_period
+ * and category_limit, rpc_upsert_category_limit's authz + closed-period (AC6)
+ * + cross-household (AC7) rejections, and unauthenticated denial (Convention
+ * 7 — assert no rows, tolerate either failure shape).
+ */
+describe("RLS-CI-01: budget period & category limit access", () => {
+  const admin = adminClient();
+  const bpRunId = `${runId}-bp`;
+  const today = new Date().toISOString().slice(0, 10);
+
+  let parentAId: string;
+  let memberId: string;
+  let parentBId: string;
+
+  let householdAId: string;
+  let budgetXId: string; // Member-owned
+  let budgetYId: string; // Parent-only
+  let periodXId: string; // Budget X's bootstrapped first period
+  let periodYId: string; // Budget Y's bootstrapped first period
+  let categoryA1Id: string;
+  let categoryBId: string; // household B
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+  let parentB: SupabaseClient;
+  const anon: SupabaseClient = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${bpRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${bpRunId}-member@example.com`;
+    const parentBEmail = `rls-ci-01-${bpRunId}-parent-b@example.com`;
+
+    for (const [email, assign] of [
+      [parentAEmail, (id: string) => (parentAId = id)],
+      [memberEmail, (id: string) => (memberId = id)],
+      [parentBEmail, (id: string) => (parentBId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+    parentB = await signInClient(parentBEmail);
+
+    const { data: parentAMember, error: pErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (pErr) throw pErr;
+    householdAId = parentAMember.household_id as string;
+
+    const { data: memberRows, error: mErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId)
+      .select("id");
+    if (mErr) throw mErr;
+    const memberMemberId = memberRows![0].id as string;
+
+    const { data: budgetX, error: bxErr } = await member.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 BP Budget X",
+        p_period_type: "monthly",
+        p_owner_member_ids: [memberMemberId],
+      },
+    );
+    if (bxErr) throw bxErr;
+    budgetXId = budgetX as string;
+
+    const { data: budgetY, error: byErr } = await parentA.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 BP Budget Y",
+        p_period_type: "monthly",
+        p_owner_member_ids: [],
+      },
+    );
+    if (byErr) throw byErr;
+    budgetYId = budgetY as string;
+
+    // Each budget got its first period from rpc_create_budget (DIP item 13).
+    const { data: pX } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", budgetXId)
+      .single();
+    periodXId = pX!.id as string;
+    const { data: pY } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", budgetYId)
+      .single();
+    periodYId = pY!.id as string;
+
+    const mkCategory = async (
+      client: SupabaseClient,
+      householdId: string,
+      name: string,
+    ) => {
+      const { data, error } = await client.rpc("rpc_upsert_category", {
+        p_household_id: householdId,
+        p_name: name,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+    categoryA1Id = await mkCategory(parentA, householdAId, "BP Cat A1");
+
+    const { data: parentBMember } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentBId)
+      .single();
+    categoryBId = await mkCategory(
+      parentB,
+      parentBMember!.household_id as string,
+      "BP Cat B",
+    );
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId, parentBId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("every new Budget is bootstrapped with exactly one period, visible to a caller who can access the Budget", async () => {
+    const { data, error } = await member
+      .from("budget_period")
+      .select("id, budget_id");
+    expect(error).toBeNull();
+    const ids = (data ?? []).map((r) => r.id);
+    expect(ids).toContain(periodXId);
+    expect(ids).not.toContain(periodYId); // Member is not an owner of Budget Y
+  });
+
+  it("a Member cannot INSERT or UPDATE a budget_period row (no client write policy exists)", async () => {
+    const { error: insErr } = await member.from("budget_period").insert({
+      budget_id: budgetXId,
+      period_start: today,
+      period_end: today,
+    });
+    expect(insErr).not.toBeNull();
+
+    // No UPDATE policy → the row is filtered out of the update's target set.
+    const { data: updated, error: updErr } = await member
+      .from("budget_period")
+      .update({ period_end: "2099-01-01" })
+      .eq("id", periodXId)
+      .select();
+    expect(updErr).toBeNull();
+    expect(updated ?? []).toHaveLength(0);
+  });
+
+  it("a Member cannot directly INSERT a category_limit row (writes go only through the RPC)", async () => {
+    const { error } = await member.from("category_limit").insert({
+      budget_period_id: periodXId,
+      category_id: categoryA1Id,
+      limit_amount: 100,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("rpc_upsert_category_limit: an owner can set and then update a limit on their own open period", async () => {
+    const { data: id1, error: e1 } = await member.rpc(
+      "rpc_upsert_category_limit",
+      {
+        p_budget_period_id: periodXId,
+        p_category_id: categoryA1Id,
+        p_limit_amount: 250,
+      },
+    );
+    expect(e1).toBeNull();
+
+    const { data: id2, error: e2 } = await member.rpc(
+      "rpc_upsert_category_limit",
+      {
+        p_budget_period_id: periodXId,
+        p_category_id: categoryA1Id,
+        p_limit_amount: 400,
+      },
+    );
+    expect(e2).toBeNull();
+    expect(id2).toBe(id1); // upsert on (budget_period_id, category_id)
+
+    const { data: row } = await member
+      .from("category_limit")
+      .select("limit_amount")
+      .eq("id", id1 as string)
+      .single();
+    expect(Number(row?.limit_amount)).toBe(400);
+  });
+
+  it("category_limit SELECT is scoped via its period's Budget — a Member never sees another Budget's limits", async () => {
+    // Parent A sets a limit on Budget Y's period.
+    const { error: seedErr } = await parentA.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: periodYId,
+      p_category_id: categoryA1Id,
+      p_limit_amount: 99,
+    });
+    if (seedErr) throw seedErr;
+
+    const { data, error } = await member
+      .from("category_limit")
+      .select("id, budget_period_id");
+    expect(error).toBeNull();
+    expect(
+      (data ?? []).some((r) => r.budget_period_id === periodYId),
+    ).toBe(false);
+  });
+
+  it("rpc_upsert_category_limit: a Member cannot write to a Budget they cannot access", async () => {
+    const { error } = await member.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: periodYId,
+      p_category_id: categoryA1Id,
+      p_limit_amount: 10,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("AC6: rpc_upsert_category_limit is rejected for a closed period, and no row is written", async () => {
+    // budget_period has no client write path, so the closed period is seeded
+    // with the service-role client (bypasses RLS; the audit trigger still fires).
+    const { data: closed, error: cErr } = await admin
+      .from("budget_period")
+      .insert({
+        budget_id: budgetXId,
+        period_start: "2020-01-01",
+        period_end: "2020-01-31",
+      })
+      .select("id")
+      .single();
+    if (cErr) throw cErr;
+    const closedPeriodId = closed!.id as string;
+
+    const { error } = await member.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: closedPeriodId,
+      p_category_id: categoryA1Id,
+      p_limit_amount: 100,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: rows } = await admin
+      .from("category_limit")
+      .select("id")
+      .eq("budget_period_id", closedPeriodId);
+    expect(rows ?? []).toHaveLength(0);
+  });
+
+  it("AC7: rpc_upsert_category_limit is rejected for a category from a different household", async () => {
+    const { error } = await member.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: periodXId,
+      p_category_id: categoryBId,
+      p_limit_amount: 100,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: rows } = await admin
+      .from("category_limit")
+      .select("id")
+      .eq("budget_period_id", periodXId)
+      .eq("category_id", categoryBId);
+    expect(rows ?? []).toHaveLength(0);
+  });
+
+  it("an unauthenticated client's direct queries on budget_period / category_limit never return rows", async () => {
+    for (const table of ["budget_period", "category_limit"]) {
+      const { data, error } = await anon.from(table).select("id");
+      // Convention 7: assert no rows; tolerate either an empty result or a
+      // permission-denied error (RLS helpers are not anon-executable).
+      expect(data ?? []).toHaveLength(0);
+      if (error) expect(error.code).toBe("42501");
+    }
+  });
+});
