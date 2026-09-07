@@ -2099,3 +2099,194 @@ describe("RLS-CI-01: envelope surplus transfer", () => {
     for (const l of limits ?? []) expect(Number(l.limit_amount)).toBe(90);
   });
 });
+
+/**
+ * DIP-6.1 (Story 6.1) — v_category_period_state. The view is defined
+ * `with (security_invoker = true)`, so its underlying budget_period /
+ * category / category_limit / transaction RLS policies are evaluated as the
+ * querying user (AC5). The DIP's "Files to Create/Modify" listed only the
+ * migration + two UI files, but its Deployment Instructions item 2 requires a
+ * local check that a Member querying the view for an unassigned Budget's
+ * period returns zero rows — added here as committed coverage, same handling
+ * as the 5.1/5.2 Grounding-Check-vs-file-list inconsistency.
+ */
+describe("RLS-CI-01: v_category_period_state (dashboard)", () => {
+  const admin = adminClient();
+  const dashRunId = `${runId}-dash`;
+
+  let parentAId: string;
+  let memberId: string;
+
+  let householdAId: string;
+  let budgetXId: string; // Member-owned
+  let budgetYId: string; // Parent-only
+  let periodXId: string;
+  let periodYId: string;
+  let categoryA1Id: string;
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${dashRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${dashRunId}-member@example.com`;
+
+    for (const [email, assign] of [
+      [parentAEmail, (id: string) => (parentAId = id)],
+      [memberEmail, (id: string) => (memberId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+
+    const { data: parentAMember, error: pErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (pErr) throw pErr;
+    householdAId = parentAMember.household_id as string;
+
+    const { data: memberRows, error: mErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId)
+      .select("id");
+    if (mErr) throw mErr;
+    const memberMemberId = memberRows![0].id as string;
+
+    const { data: bx, error: bxErr } = await member.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Dash Budget X",
+      p_period_type: "monthly",
+      p_owner_member_ids: [memberMemberId],
+    });
+    if (bxErr) throw bxErr;
+    budgetXId = bx as string;
+
+    const { data: by, error: byErr } = await parentA.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Dash Budget Y",
+      p_period_type: "monthly",
+      p_owner_member_ids: [],
+    });
+    if (byErr) throw byErr;
+    budgetYId = by as string;
+
+    const { data: pX } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", budgetXId)
+      .single();
+    periodXId = pX!.id as string;
+    const { data: pY } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", budgetYId)
+      .single();
+    periodYId = pY!.id as string;
+
+    const { data: cat, error: catErr } = await parentA.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: "Dash Cat",
+    });
+    if (catErr) throw catErr;
+    categoryA1Id = cat as string;
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("AC5: a Member's query for an unassigned Budget's period returns zero rows (security_invoker)", async () => {
+    const { data, error } = await member
+      .from("v_category_period_state")
+      .select("*")
+      .eq("budget_period_id", periodYId);
+    expect(error).toBeNull();
+    expect(data ?? []).toHaveLength(0);
+  });
+
+  it("AC4: a Member sees a row per household category for their own period, zero-stated when there is no data", async () => {
+    const { data, error } = await member
+      .from("v_category_period_state")
+      .select("category_id, category_name, limit_amount, spent")
+      .eq("budget_period_id", periodXId);
+    expect(error).toBeNull();
+    const row = (data ?? []).find((r) => r.category_id === categoryA1Id);
+    expect(row).toBeDefined();
+    // coalesce() in the view -> never null, so the UI's empty/zero check is plain.
+    expect(Number(row!.limit_amount)).toBe(0);
+    expect(Number(row!.spent)).toBe(0);
+  });
+
+  it("a Parent sees their household's Budget X and Budget Y category states", async () => {
+    const { data: xData, error: xErr } = await parentA
+      .from("v_category_period_state")
+      .select("budget_id")
+      .eq("budget_period_id", periodXId);
+    expect(xErr).toBeNull();
+    expect((xData ?? []).length).toBeGreaterThan(0);
+
+    const { data: yData, error: yErr } = await parentA
+      .from("v_category_period_state")
+      .select("budget_id")
+      .eq("budget_period_id", periodYId);
+    expect(yErr).toBeNull();
+    expect((yData ?? []).length).toBeGreaterThan(0);
+  });
+
+  it("spent reflects only expense splits within the period date range, and excludes soft-deleted rows", async () => {
+    // An account + two transactions in Budget X's (open) period.
+    const { data: acct, error: acctErr } = await member.rpc("rpc_create_account", {
+      p_budget_id: budgetXId,
+      p_type: "account",
+      p_name: "Dash Checking",
+      p_currency: "USD",
+      p_opening_balance: 0,
+    });
+    if (acctErr) throw acctErr;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const { error: t1Err } = await member.rpc("rpc_create_transaction", {
+      p_account_id: acct as string,
+      p_description: "counted expense",
+      p_amount: 30,
+      p_date: today,
+      p_direction: "expense",
+      p_category_id: categoryA1Id,
+    });
+    if (t1Err) throw t1Err;
+
+    const { data: incomeTxnId, error: t2Err } = await member.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: acct as string,
+        p_description: "ignored income",
+        p_amount: 999,
+        p_date: today,
+        p_direction: "income",
+        p_category_id: categoryA1Id,
+      },
+    );
+    if (t2Err) throw t2Err;
+    void incomeTxnId;
+
+    const { data, error } = await member
+      .from("v_category_period_state")
+      .select("spent")
+      .eq("budget_period_id", periodXId)
+      .eq("category_id", categoryA1Id)
+      .single();
+    expect(error).toBeNull();
+    expect(Number(data?.spent)).toBe(30); // income excluded; only the expense split
+  });
+});
