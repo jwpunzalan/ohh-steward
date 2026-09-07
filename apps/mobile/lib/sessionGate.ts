@@ -70,3 +70,21 @@ export async function checkIdleAndSignOutIfElapsed(
   }
   return "still-active";
 }
+
+// STEW-37: run the same idle-elapsed check before every protected mutating
+// action, not only at cold start / app-resume. On elapsed, sign this device
+// out (local scope only — never 'global') and return false so the caller
+// aborts before any network call; otherwise record the activity and return
+// true. Same fail-closed pattern as the two gates above.
+export async function guardIdleOrSignOut(
+  sessionTimeoutMinutes: number,
+): Promise<boolean> {
+  const idleElapsedMinutes = await getIdleElapsedMinutes();
+  if (idleElapsedMinutes > sessionTimeoutMinutes) {
+    await supabase.auth.signOut({ scope: "local" });
+    await clearStoredSession();
+    return false;
+  }
+  await touchActivity();
+  return true;
+}

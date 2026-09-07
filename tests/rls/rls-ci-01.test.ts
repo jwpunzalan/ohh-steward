@@ -260,6 +260,60 @@ describe("RLS-CI-01: budget tenant isolation", () => {
       .insert({ budget_id: budgetXId, household_member_id: row!.id });
     expect(error).not.toBeNull();
   });
+
+  // STEW-33 (AC2): the three earliest SECURITY DEFINER functions each still
+  // granted EXECUTE to `anon` until the hardening-batch migration. An
+  // unauthenticated caller must be rejected at the grant layer — the call
+  // never reaches the function's own auth.uid() check. Mirrors the
+  // rpc_create_transaction anon-denial test in the transaction describe block.
+  it("STEW-33: an anon client cannot call rpc_create_budget / is_household_parent / can_access_budget directly", async () => {
+    const anon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const someUuid = "00000000-0000-0000-0000-000000000000";
+
+    const { error: createBudgetErr } = await anon.rpc("rpc_create_budget", {
+      p_name: "anon budget",
+      p_period_type: "monthly",
+      p_owner_member_ids: [],
+    });
+    expect(createBudgetErr).not.toBeNull();
+
+    const { error: isParentErr } = await anon.rpc("is_household_parent", {
+      p_household_id: someUuid,
+    });
+    expect(isParentErr).not.toBeNull();
+
+    const { error: canAccessErr } = await anon.rpc("can_access_budget", {
+      p_budget_id: someUuid,
+    });
+    expect(canAccessErr).not.toBeNull();
+  });
+
+  it("STEW-33: authenticated callers keep their existing access to the three functions", async () => {
+    // Regression guard for AC1 — the anon revoke must not touch authenticated's
+    // grant. Parent A can still create a budget and evaluate the helpers.
+    const { error: createBudgetErr } = await parentA.rpc("rpc_create_budget", {
+      p_name: "STEW-33 authed budget",
+      p_period_type: "monthly",
+      p_owner_member_ids: [],
+    });
+    expect(createBudgetErr).toBeNull();
+
+    const { data: isParent, error: isParentErr } = await parentA.rpc(
+      "is_household_parent",
+      { p_household_id: householdId },
+    );
+    expect(isParentErr).toBeNull();
+    expect(isParent).toBe(true);
+
+    const { data: canAccess, error: canAccessErr } = await parentA.rpc(
+      "can_access_budget",
+      { p_budget_id: budgetXId },
+    );
+    expect(canAccessErr).toBeNull();
+    expect(canAccess).toBe(true);
+  });
 });
 
 /**

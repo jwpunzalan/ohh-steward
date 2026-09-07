@@ -11,6 +11,7 @@ import {
 } from "./lib/session";
 import {
   checkIdleAndSignOutIfElapsed,
+  guardIdleOrSignOut,
   resumeStoredSessionIfAllowed,
 } from "./lib/sessionGate";
 import type { Session } from "@supabase/supabase-js";
@@ -171,112 +172,126 @@ export default function App() {
     setSubmitting(true);
     setError(null);
 
-    if (mode === "signup") {
-      // Household bootstrap happens server-side via a database trigger on
-      // auth.users (Story 1.1.G2) — unconditionally, at account-creation
-      // time, regardless of whether email confirmation is required. No
-      // client-side bootstrap call exists: under mandatory email
-      // confirmation (this project's actual configuration), signUp()
-      // returns session: null until the user confirms, so any call
-      // requiring an authenticated session would run as anon and fail.
-      const { data, error: signUpError } = await supabase.auth.signUp({
-        email,
-        password,
-      });
-      if (signUpError) {
-        // Never surface raw Supabase/Postgres error text (Secure Coding
-        // obligation 10) — e.g. Supabase Auth's native duplicate-email error.
-        setError("We couldn't create your account. Please try again.");
-        setSubmitting(false);
-        return;
-      }
-
-      // Mandatory email confirmation (this project's actual configuration)
-      // means signUp() returns session: null until the user confirms — not
-      // an error. completeAuthentication() (session caching, biometric
-      // storage) only makes sense once a session actually exists, so it
-      // must never run on this branch.
-      if (!data.session) {
-        setSubmitting(false);
-        setScreen("check-email");
-        return;
-      }
-
-      await completeAuthentication(data.session);
-    } else {
-      // AC1: any device with no valid stored session always goes through
-      // the full flow — password, then MFA challenge if the user has 2FA
-      // enrolled — never a shortcut.
-      const { data, error: signInError } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
-      if (signInError || !data.session) {
-        setError("Invalid email or password.");
-        setSubmitting(false);
-        return;
-      }
-
-      const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-      if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
-        const { data: factors, error: factorsError } =
-          await supabase.auth.mfa.listFactors();
-        const factor = factors?.totp?.[0];
-        if (factorsError || !factor) {
-          setError("We couldn't complete sign-in. Please try again.");
+    try {
+      if (mode === "signup") {
+        // Household bootstrap happens server-side via a database trigger on
+        // auth.users (Story 1.1.G2) — unconditionally, at account-creation
+        // time, regardless of whether email confirmation is required. No
+        // client-side bootstrap call exists: under mandatory email
+        // confirmation (this project's actual configuration), signUp()
+        // returns session: null until the user confirms, so any call
+        // requiring an authenticated session would run as anon and fail.
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email,
+          password,
+        });
+        if (signUpError) {
+          // Never surface raw Supabase/Postgres error text (Secure Coding
+          // obligation 10) — e.g. Supabase Auth's native duplicate-email error.
+          setError("We couldn't create your account. Please try again.");
           setSubmitting(false);
           return;
         }
-        const { data: challenge, error: challengeError } =
-          await supabase.auth.mfa.challenge({ factorId: factor.id });
-        if (challengeError || !challenge) {
-          setError("We couldn't complete sign-in. Please try again.");
+
+        // Mandatory email confirmation (this project's actual configuration)
+        // means signUp() returns session: null until the user confirms — not
+        // an error. completeAuthentication() (session caching, biometric
+        // storage) only makes sense once a session actually exists, so it
+        // must never run on this branch.
+        if (!data.session) {
+          setSubmitting(false);
+          setScreen("check-email");
+          return;
+        }
+
+        await completeAuthentication(data.session);
+      } else {
+        // AC1: any device with no valid stored session always goes through
+        // the full flow — password, then MFA challenge if the user has 2FA
+        // enrolled — never a shortcut.
+        const { data, error: signInError } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+        if (signInError || !data.session) {
+          setError("Invalid email or password.");
           setSubmitting(false);
           return;
         }
-        setMfaFactorId(factor.id);
-        setMfaChallengeId(challenge.id);
-        setSubmitting(false);
-        setScreen("mfa-challenge");
-        return;
+
+        const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+        if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
+          const { data: factors, error: factorsError } =
+            await supabase.auth.mfa.listFactors();
+          const factor = factors?.totp?.[0];
+          if (factorsError || !factor) {
+            setError("We couldn't complete sign-in. Please try again.");
+            setSubmitting(false);
+            return;
+          }
+          const { data: challenge, error: challengeError } =
+            await supabase.auth.mfa.challenge({ factorId: factor.id });
+          if (challengeError || !challenge) {
+            setError("We couldn't complete sign-in. Please try again.");
+            setSubmitting(false);
+            return;
+          }
+          setMfaFactorId(factor.id);
+          setMfaChallengeId(challenge.id);
+          setSubmitting(false);
+          setScreen("mfa-challenge");
+          return;
+        }
+
+        await completeAuthentication(data.session);
       }
 
-      await completeAuthentication(data.session);
+      setSubmitting(false);
+      setScreen("dashboard");
+    } catch {
+      // STEW-36: a thrown exception (not a normal { error } result) must never
+      // leave the form permanently stuck submitting. Generic message only
+      // (obligation 10) — no "page reload" wording; this is a native app.
+      setError("Something went wrong. Please try again.");
+      setSubmitting(false);
     }
-
-    setSubmitting(false);
-    setScreen("dashboard");
   }
 
   async function handleVerifyMfa() {
     setSubmitting(true);
     setError(null);
 
-    const { data, error: verifyError } = await supabase.auth.mfa.verify({
-      factorId: mfaFactorId,
-      challengeId: mfaChallengeId,
-      code: mfaCode,
-    });
+    try {
+      const { data, error: verifyError } = await supabase.auth.mfa.verify({
+        factorId: mfaFactorId,
+        challengeId: mfaChallengeId,
+        code: mfaCode,
+      });
 
-    if (verifyError || !data) {
-      setError("Invalid code. Please try again.");
+      if (verifyError || !data) {
+        setError("Invalid code. Please try again.");
+        setSubmitting(false);
+        return;
+      }
+
+      // mfa.verify() returns the new session as flat fields, not a nested
+      // `session` object — structurally the same shape completeAuthentication
+      // needs (access_token/refresh_token/user), just reassembled here.
+      await completeAuthentication({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_in: data.expires_in,
+        token_type: data.token_type,
+        user: data.user,
+      } as Session);
+      setMfaCode("");
       setSubmitting(false);
-      return;
+      setScreen("dashboard");
+    } catch {
+      // STEW-36: see handleSubmit — a thrown exception must not strand the form.
+      setError("We couldn't verify that code. Please try again.");
+      setSubmitting(false);
     }
-
-    // mfa.verify() returns the new session as flat fields, not a nested
-    // `session` object — structurally the same shape completeAuthentication
-    // needs (access_token/refresh_token/user), just reassembled here.
-    await completeAuthentication({
-      access_token: data.access_token,
-      refresh_token: data.refresh_token,
-      expires_in: data.expires_in,
-      token_type: data.token_type,
-      user: data.user,
-    } as Session);
-    setMfaCode("");
-    setSubmitting(false);
-    setScreen("dashboard");
   }
 
   async function handleStartEnrollment() {
@@ -335,7 +350,14 @@ export default function App() {
   async function handleCreateBudget() {
     setSubmitting(true);
     setError(null);
-    await touchActivity();
+    // STEW-37: enforce the idle timeout before any network call — not only at
+    // cold start / app-resume. On elapsed: local-scope sign-out, back to auth.
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
 
     const {
       data: { user },
@@ -399,7 +421,13 @@ export default function App() {
   async function handleCreateAccount() {
     setSubmitting(true);
     setError(null);
-    await touchActivity();
+    // STEW-37: enforce the idle timeout before any network call.
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
 
     const { error: createError } = await supabase.rpc("rpc_create_account", {
       p_budget_id: accountBudgetId,
@@ -468,7 +496,13 @@ export default function App() {
     }
 
     setSubmitting(true);
-    await touchActivity();
+    // STEW-37: enforce the idle timeout before any network call.
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
 
     // p_budget_id is intentionally never sent — the RPC derives it from the
     // referenced account server-side (AC5). In split mode p_category_id is
@@ -541,7 +575,13 @@ export default function App() {
     }
 
     setSubmitting(true);
-    await touchActivity();
+    // STEW-37: enforce the idle timeout before any network call.
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
 
     // p_amount is never sent — rpc_set_transaction_splits reads the
     // transaction's own amount server-side (AC3/AC5).
@@ -567,7 +607,13 @@ export default function App() {
     setSubmitting(true);
     setError(null);
     setInviteSent(false);
-    await touchActivity();
+    // STEW-37: enforce the idle timeout before any network call.
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
 
     const { error: inviteError } = await supabase.rpc("rpc_create_invite", {
       p_email: inviteEmail,
@@ -620,7 +666,13 @@ export default function App() {
   async function handleDeleteAccount() {
     setSubmitting(true);
     setError(null);
-    await touchActivity();
+    // STEW-37: enforce the idle timeout before any network call.
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
 
     const { error: invokeError } = await supabase.functions.invoke(
       "delete-own-account",
