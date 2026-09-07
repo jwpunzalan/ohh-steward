@@ -31,7 +31,7 @@ type Screen =
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
-type Budget = { id: string; name: string };
+type Budget = { id: string; name: string; default_currency: string | null };
 
 // After any successful full authentication (signup, password-only signin,
 // or a signin's MFA challenge/verify step), persist the session for future
@@ -89,6 +89,7 @@ export default function App() {
   const [accountType, setAccountType] = useState<AccountType>("account");
   const [accountName, setAccountName] = useState("");
   const [accountCurrency, setAccountCurrency] = useState("USD");
+  const [accountCurrencyTouched, setAccountCurrencyTouched] = useState(false);
   const [accountOpeningBalance, setAccountOpeningBalance] = useState("0");
   const [accountTargetAmount, setAccountTargetAmount] = useState("");
   const [accountCreditLimit, setAccountCreditLimit] = useState("");
@@ -344,10 +345,17 @@ export default function App() {
   }
 
   async function loadAccountBudgets() {
-    const { data } = await supabase.from("budget").select("id, name");
+    const { data } = await supabase
+      .from("budget")
+      .select("id, name, default_currency");
     if (data) {
       setAccountBudgets(data);
-      if (data[0]) setAccountBudgetId(data[0].id);
+      if (data[0]) {
+        setAccountBudgetId(data[0].id);
+        if (!accountCurrencyTouched) {
+          setAccountCurrency(data[0].default_currency ?? "USD");
+        }
+      }
     }
   }
 
@@ -699,7 +707,12 @@ export default function App() {
                 (accountBudgets.findIndex((b) => b.id === accountBudgetId) + 1) %
                   accountBudgets.length
               ];
-            if (next) setAccountBudgetId(next.id);
+            if (next) {
+              setAccountBudgetId(next.id);
+              if (!accountCurrencyTouched) {
+                setAccountCurrency(next.default_currency ?? "USD");
+              }
+            }
           }}
         >
           <Text style={styles.link}>
@@ -732,7 +745,10 @@ export default function App() {
           style={styles.input}
           placeholder="Currency"
           value={accountCurrency}
-          onChangeText={(text) => setAccountCurrency(text.toUpperCase())}
+          onChangeText={(text) => {
+            setAccountCurrency(text.toUpperCase());
+            setAccountCurrencyTouched(true);
+          }}
           maxLength={3}
           autoCapitalize="characters"
         />
