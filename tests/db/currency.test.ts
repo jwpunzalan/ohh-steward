@@ -163,37 +163,182 @@ describe("Story 2.4: currency reference table and FK validation", () => {
     expect(data?.default_currency).toBe("EUR");
   });
 
-  it("a Budget-scoped aggregation query groups by currency rather than summing across currencies (AC2)", async () => {
-    const { error: secondAccountErr } = await parent.rpc(
-      "rpc_create_account",
-      {
-        p_budget_id: budgetId,
-        p_type: "savings",
-        p_name: "GBP Savings",
-        p_currency: "GBP",
-        p_opening_balance: 250,
-      },
-    );
-    expect(secondAccountErr).toBeNull();
+  // Story 2.4's original AC2 assumed a single Budget could span multiple
+  // currencies (with per-currency grouped totals). DIP-2.4.G2 (STEW-42)
+  // superseded that per the Product Owner's clarification: one Budget is
+  // always single-currency (multi-currency = separate Budgets), enforced by
+  // the trg_account_validate_currency_matches_budget trigger on `account`.
+  // This test now asserts that invariant: budgetId already holds a USD
+  // account (from the AC1 test above).
+  it("2.4.G2: a second account in a different currency is rejected; the first account's currency is the Budget's currency (supersedes Story 2.4 AC2)", async () => {
+    const { error: gbpErr } = await parent.rpc("rpc_create_account", {
+      p_budget_id: budgetId,
+      p_type: "savings",
+      p_name: "GBP Savings",
+      p_currency: "GBP",
+      p_opening_balance: 250,
+    });
+    expect(gbpErr).not.toBeNull();
 
-    const { data, error } = await admin
+    // No GBP row was written; USD stays the Budget's only currency.
+    const { data: afterReject } = await admin
       .from("account")
-      .select("currency, current_balance")
+      .select("currency")
       .eq("budget_id", budgetId)
       .eq("is_deleted", false);
-    expect(error).toBeNull();
+    expect(new Set((afterReject ?? []).map((r) => r.currency))).toEqual(
+      new Set(["USD"]),
+    );
 
-    const totalsByCurrency = new Map<string, number>();
-    for (const row of data ?? []) {
-      totalsByCurrency.set(
-        row.currency,
-        (totalsByCurrency.get(row.currency) ?? 0) + Number(row.current_balance),
-      );
+    // AC3: another account in the SAME currency still succeeds as before.
+    const { error: usd2Err } = await parent.rpc("rpc_create_account", {
+      p_budget_id: budgetId,
+      p_type: "savings",
+      p_name: "Second USD Savings",
+      p_currency: "USD",
+      p_opening_balance: 10,
+    });
+    expect(usd2Err).toBeNull();
+  });
+});
+
+/**
+ * DIP-2.4.G2 (STEW-42) — one currency per Budget, DB-enforced by
+ * trg_account_validate_currency_matches_budget. AC2/AC3 are covered by the
+ * updated "2.4.G2: a second account in a different currency is rejected"
+ * test above; this block covers AC1 (first account, any currency), AC4
+ * (UPDATE of currency / budget_id is rejected on mismatch), and AC5
+ * (a soft-deleted account no longer constrains the Budget's currency).
+ * Schema-constraint scope, not tenant isolation — same rationale this file's
+ * docstring gives for living outside tests/rls/.
+ */
+describe("DIP-2.4.G2: one currency per Budget", () => {
+  const admin = adminClient();
+
+  let owner: SupabaseClient;
+  let ownerId: string;
+  let budgetA: string;
+  let budgetB: string;
+
+  beforeAll(async () => {
+    const email = `currency-test-${runId}-g2@example.com`;
+    const { data: user, error: userErr } = await admin.auth.admin.createUser({
+      email,
+      password: TEST_PASSWORD,
+      email_confirm: true,
+    });
+    if (userErr) throw userErr;
+    ownerId = user.user.id;
+    owner = await signInClient(email);
+
+    for (const name of ["G2 Budget A", "G2 Budget B"]) {
+      const { data, error } = await owner.rpc("rpc_create_budget", {
+        p_name: name,
+        p_period_type: "monthly",
+        p_owner_member_ids: [],
+      });
+      if (error) throw error;
+      if (name.endsWith("A")) budgetA = data as string;
+      else budgetB = data as string;
     }
+  });
 
-    // USD (100 from the earlier valid-account test) and GBP (250) must
-    // remain distinct entries, never combined into one blended figure.
-    expect(totalsByCurrency.get("USD")).toBe(100);
-    expect(totalsByCurrency.get("GBP")).toBe(250);
+  afterAll(async () => {
+    if (ownerId) await admin.auth.admin.deleteUser(ownerId).catch(() => {});
+  });
+
+  it("AC1: the first account in an empty Budget succeeds with any valid currency", async () => {
+    const { error } = await owner.rpc("rpc_create_account", {
+      p_budget_id: budgetA,
+      p_type: "account",
+      p_name: "A EUR",
+      p_currency: "EUR",
+      p_opening_balance: 0,
+    });
+    expect(error).toBeNull();
+  });
+
+  it("AC4: a direct UPDATE of an account's currency to a mismatching value is rejected", async () => {
+    // budgetA has an EUR account; add a second EUR account, then try to flip
+    // its currency to USD via a direct (service-role) update.
+    const { data: acctId, error: createErr } = await owner.rpc(
+      "rpc_create_account",
+      {
+        p_budget_id: budgetA,
+        p_type: "savings",
+        p_name: "A EUR 2",
+        p_currency: "EUR",
+        p_opening_balance: 0,
+      },
+    );
+    if (createErr) throw createErr;
+
+    const { error: updErr } = await admin
+      .from("account")
+      .update({ currency: "USD" })
+      .eq("id", acctId as string);
+    expect(updErr).not.toBeNull();
+
+    const { data: unchanged } = await admin
+      .from("account")
+      .select("currency")
+      .eq("id", acctId as string)
+      .single();
+    expect(unchanged?.currency).toBe("EUR");
+  });
+
+  it("AC4: moving an account into a Budget whose currency differs is rejected", async () => {
+    // budgetB gets a USD account; moving it into budgetA (EUR) must fail.
+    const { data: usdAcctId, error: createErr } = await owner.rpc(
+      "rpc_create_account",
+      {
+        p_budget_id: budgetB,
+        p_type: "account",
+        p_name: "B USD",
+        p_currency: "USD",
+        p_opening_balance: 0,
+      },
+    );
+    if (createErr) throw createErr;
+
+    const { error: moveErr } = await admin
+      .from("account")
+      .update({ budget_id: budgetA })
+      .eq("id", usdAcctId as string);
+    expect(moveErr).not.toBeNull();
+  });
+
+  it("AC5: a soft-deleted account no longer constrains the Budget's currency", async () => {
+    // Fresh Budget: create a JPY account, soft-delete it, then a USD account
+    // in the same Budget must succeed (the JPY row is ignored).
+    const { data: freshBudget, error: bErr } = await owner.rpc(
+      "rpc_create_budget",
+      { p_name: "G2 Budget C", p_period_type: "monthly", p_owner_member_ids: [] },
+    );
+    if (bErr) throw bErr;
+
+    const { data: jpyId, error: jpyErr } = await owner.rpc("rpc_create_account", {
+      p_budget_id: freshBudget as string,
+      p_type: "account",
+      p_name: "C JPY",
+      p_currency: "JPY",
+      p_opening_balance: 0,
+    });
+    if (jpyErr) throw jpyErr;
+
+    const { error: delErr } = await admin
+      .from("account")
+      .update({ is_deleted: true })
+      .eq("id", jpyId as string);
+    expect(delErr).toBeNull();
+
+    const { error: usdErr } = await owner.rpc("rpc_create_account", {
+      p_budget_id: freshBudget as string,
+      p_type: "account",
+      p_name: "C USD",
+      p_currency: "USD",
+      p_opening_balance: 0,
+    });
+    expect(usdErr).toBeNull();
   });
 });

@@ -1960,8 +1960,14 @@ describe("RLS-CI-01: envelope surplus transfer", () => {
     expect((memberView ?? []).map((r) => r.id)).toContain(transfers![0].id);
   });
 
-  it("AC7: a multi-currency Budget produces no transfer and credits nothing", async () => {
-    // A fresh Budget with two account currencies.
+  // AC7 was written against a Budget spanning >1 currency. DIP-2.4.G2
+  // (STEW-42) later made that state impossible to create: the
+  // trg_account_validate_currency_matches_budget trigger rejects the second,
+  // different-currency account. fn_create_surplus_transfer's own
+  // `count(distinct currency) <> 1` guard is now defensive-only. This test is
+  // updated to assert the state is unreachable rather than that the surplus
+  // path handles it.
+  it("AC7 (post-2.4.G2): a multi-currency Budget cannot be created, so the multi-currency surplus path is unreachable", async () => {
     const { data: memberRow } = await admin
       .from("household_member")
       .select("id")
@@ -1975,55 +1981,32 @@ describe("RLS-CI-01: envelope surplus transfer", () => {
     if (bmcErr) throw bmcErr;
     const mcBudgetId = bmc as string;
 
-    const mkAccount = async (name: string, currency: string) => {
-      const { data, error } = await member.rpc("rpc_create_account", {
-        p_budget_id: mcBudgetId,
-        p_type: "savings",
-        p_name: name,
-        p_currency: currency,
-        p_opening_balance: 0,
-      });
-      if (error) throw error;
-      return data as string;
-    };
-    const usdDest = await mkAccount("MC USD", "USD");
-    await mkAccount("MC EUR", "EUR");
-
-    await member
-      .from("budget")
-      .update({ surplus_destination_id: usdDest })
-      .eq("id", mcBudgetId);
-
-    const { data: mcPeriod } = await admin
-      .from("budget_period")
-      .select("id")
-      .eq("budget_id", mcBudgetId)
-      .single();
-    await member.rpc("rpc_upsert_category_limit", {
-      p_budget_period_id: mcPeriod!.id,
-      p_category_id: categoryA1Id,
-      p_limit_amount: 50,
+    const { error: usdErr } = await member.rpc("rpc_create_account", {
+      p_budget_id: mcBudgetId,
+      p_type: "savings",
+      p_name: "MC USD",
+      p_currency: "USD",
+      p_opening_balance: 0,
     });
-    await admin
-      .from("budget_period")
-      .update({ period_start: "2020-02-01", period_end: "2020-02-28" })
-      .eq("id", mcPeriod!.id);
+    expect(usdErr).toBeNull();
 
-    const { error: rollErr } = await admin.rpc("fn_rollover_budget_periods");
-    expect(rollErr).toBeNull();
+    const { error: eurErr } = await member.rpc("rpc_create_account", {
+      p_budget_id: mcBudgetId,
+      p_type: "savings",
+      p_name: "MC EUR",
+      p_currency: "EUR",
+      p_opening_balance: 0,
+    });
+    expect(eurErr).not.toBeNull();
 
-    const { data: transfers } = await admin
-      .from("transfer")
-      .select("id")
-      .eq("budget_period_id", mcPeriod!.id);
-    expect(transfers ?? []).toHaveLength(0);
-
-    const { data: acct } = await admin
+    const { data: accts } = await admin
       .from("account")
-      .select("current_balance")
-      .eq("id", usdDest)
-      .single();
-    expect(Number(acct?.current_balance)).toBe(0);
+      .select("currency")
+      .eq("budget_id", mcBudgetId)
+      .eq("is_deleted", false);
+    expect(new Set((accts ?? []).map((r) => r.currency))).toEqual(
+      new Set(["USD"]),
+    );
   });
 
   it("an unauthenticated client's direct query on transfer never returns rows", async () => {
