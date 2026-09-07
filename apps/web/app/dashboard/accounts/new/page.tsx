@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
 type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
-type Budget = { id: string; name: string };
+type Budget = { id: string; name: string; default_currency: string | null };
 
 export default function NewAccountPage() {
   const router = useRouter();
@@ -14,6 +14,7 @@ export default function NewAccountPage() {
   const [type, setType] = useState<AccountType>("account");
   const [name, setName] = useState("");
   const [currency, setCurrency] = useState("USD");
+  const [currencyTouched, setCurrencyTouched] = useState(false);
   const [openingBalance, setOpeningBalance] = useState("0");
   const [targetAmount, setTargetAmount] = useState("");
   const [targetDate, setTargetDate] = useState("");
@@ -27,7 +28,7 @@ export default function NewAccountPage() {
     const supabase = createClient();
     supabase
       .from("budget")
-      .select("id, name")
+      .select("id, name, default_currency")
       .then(({ data }) => {
         if (data) {
           setBudgets(data);
@@ -35,6 +36,13 @@ export default function NewAccountPage() {
         }
       });
   }, []);
+
+  useEffect(() => {
+    if (currencyTouched) return;
+    const selected = budgets.find((budget) => budget.id === budgetId);
+    if (!selected) return;
+    setCurrency(selected.default_currency ?? "USD");
+  }, [budgetId, budgets, currencyTouched]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -116,7 +124,10 @@ export default function NewAccountPage() {
           id="currency"
           type="text"
           value={currency}
-          onChange={(event) => setCurrency(event.target.value.toUpperCase())}
+          onChange={(event) => {
+            setCurrency(event.target.value.toUpperCase());
+            setCurrencyTouched(true);
+          }}
           maxLength={3}
           required
         />
