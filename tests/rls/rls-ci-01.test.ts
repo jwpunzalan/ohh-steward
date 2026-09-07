@@ -840,3 +840,393 @@ describe("RLS-CI-01: transaction budget-scoped access", () => {
     expect(rows ?? []).toHaveLength(0);
   });
 });
+
+/**
+ * DIP-3.2 (Story 3.2) — Split-transaction sum validation and retroactive
+ * splitting. Committed deliverable per IMPLEMENTATION_CONVENTIONS item 5;
+ * DVP.md §3's row for this story: "Split sum-validation rejects mismatched
+ * totals (server-side, not just client); retroactive split on existing
+ * transaction." Scoped to what 3.2 adds on top of 3.1's Transaction-side
+ * coverage: the two write paths (creation with p_splits, retroactive
+ * rpc_set_transaction_splits), both the RPC-layer and the deferred-trigger
+ * layer independently, and the new category-scope trigger. Own fixtures:
+ * household A (Parent A + a Member owning Budget X only; Budget Y is
+ * Parent-only) and household B (Parent B) for the cross-household category
+ * cases.
+ */
+describe("RLS-CI-01: transaction split sum validation and retroactive splitting", () => {
+  const admin = adminClient();
+  const splitRunId = `${runId}-split`;
+  const today = new Date().toISOString().slice(0, 10);
+
+  let parentAId: string;
+  let memberId: string;
+  let parentBId: string;
+
+  let householdAId: string;
+  let budgetXId: string; // Member-owned
+  let budgetYId: string; // Parent-only
+  let accountXId: string;
+  let accountYId: string;
+  let categoryA1Id: string;
+  let categoryA2Id: string;
+  let categoryBId: string; // household B
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+  let parentB: SupabaseClient;
+  const anon: SupabaseClient = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  async function splitsFor(transactionId: string) {
+    const { data } = await admin
+      .from("transaction_split")
+      .select("category_id, amount")
+      .eq("transaction_id", transactionId);
+    return (data ?? [])
+      .map((r) => ({
+        category_id: r.category_id as string | null,
+        amount: Number(r.amount),
+      }))
+      .sort((a, b) => a.amount - b.amount);
+  }
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${splitRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${splitRunId}-member@example.com`;
+    const parentBEmail = `rls-ci-01-${splitRunId}-parent-b@example.com`;
+
+    for (const [email, assign] of [
+      [parentAEmail, (id: string) => (parentAId = id)],
+      [memberEmail, (id: string) => (memberId = id)],
+      [parentBEmail, (id: string) => (parentBId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+    parentB = await signInClient(parentBEmail);
+
+    const { data: parentAMember, error: parentAMemberErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (parentAMemberErr) throw parentAMemberErr;
+    householdAId = parentAMember.household_id as string;
+
+    const { data: memberRows, error: memberUpdateErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId)
+      .select("id");
+    if (memberUpdateErr) throw memberUpdateErr;
+    const memberMemberId = memberRows![0].id as string;
+
+    const { data: budgetX, error: budgetXErr } = await member.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 Split Budget X",
+        p_period_type: "monthly",
+        p_owner_member_ids: [memberMemberId],
+      },
+    );
+    if (budgetXErr) throw budgetXErr;
+    budgetXId = budgetX as string;
+
+    const { data: budgetY, error: budgetYErr } = await parentA.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 Split Budget Y",
+        p_period_type: "monthly",
+        p_owner_member_ids: [],
+      },
+    );
+    if (budgetYErr) throw budgetYErr;
+    budgetYId = budgetY as string;
+
+    const mkAccount = async (
+      client: SupabaseClient,
+      budgetId: string,
+      name: string,
+    ) => {
+      const { data, error } = await client.rpc("rpc_create_account", {
+        p_budget_id: budgetId,
+        p_type: "account",
+        p_name: name,
+        p_currency: "USD",
+        p_opening_balance: 0,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+    accountXId = await mkAccount(member, budgetXId, "Split X Checking");
+    accountYId = await mkAccount(parentA, budgetYId, "Split Y Checking");
+
+    const mkCategory = async (
+      client: SupabaseClient,
+      householdId: string,
+      name: string,
+    ) => {
+      const { data, error } = await client.rpc("rpc_upsert_category", {
+        p_household_id: householdId,
+        p_name: name,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+    categoryA1Id = await mkCategory(parentA, householdAId, "Split Cat A1");
+    categoryA2Id = await mkCategory(parentA, householdAId, "Split Cat A2");
+
+    const { data: parentBMember, error: parentBMemberErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentBId)
+      .single();
+    if (parentBMemberErr) throw parentBMemberErr;
+    categoryBId = await mkCategory(
+      parentB,
+      parentBMember.household_id as string,
+      "Split Cat B",
+    );
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId, parentBId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("(a) create with p_splits summing exactly to p_amount succeeds and writes N split rows", async () => {
+    const { data: txnId, error } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: "Split create OK",
+      p_amount: 10,
+      p_date: today,
+      p_splits: [
+        { category_id: categoryA1Id, amount: 6 },
+        { category_id: categoryA2Id, amount: 4 },
+      ],
+    });
+    expect(error).toBeNull();
+    expect(await splitsFor(txnId as string)).toEqual([
+      { category_id: categoryA2Id, amount: 4 },
+      { category_id: categoryA1Id, amount: 6 },
+    ]);
+  });
+
+  it("(b) create with a mismatched split sum fails and leaves NO transaction row", async () => {
+    const desc = `Split create mismatch ${splitRunId}`;
+    const { error } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: desc,
+      p_amount: 10,
+      p_date: today,
+      p_splits: [
+        { category_id: categoryA1Id, amount: 6 },
+        { category_id: categoryA2Id, amount: 3 },
+      ],
+    });
+    expect(error).not.toBeNull();
+
+    const { data: rows } = await admin
+      .from("transaction")
+      .select("id")
+      .eq("description", desc);
+    expect(rows ?? []).toHaveLength(0);
+  });
+
+  it("(b) create rejects p_splits and p_category_id supplied together", async () => {
+    const { error } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: "Split + category",
+      p_amount: 10,
+      p_date: today,
+      p_category_id: categoryA1Id,
+      p_splits: [{ category_id: categoryA2Id, amount: 10 }],
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("(c) rpc_set_transaction_splits with a matching sum fully replaces an existing transaction's splits", async () => {
+    const { data: txnId, error: createErr } = await member.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: accountXId,
+        p_description: "Retro replace OK",
+        p_amount: 20,
+        p_date: today,
+      },
+    );
+    if (createErr) throw createErr;
+    // 3.1 default: exactly one uncategorized split of the full amount.
+    expect(await splitsFor(txnId as string)).toEqual([
+      { category_id: null, amount: 20 },
+    ]);
+
+    const { error } = await member.rpc("rpc_set_transaction_splits", {
+      p_transaction_id: txnId as string,
+      p_splits: [
+        { category_id: categoryA1Id, amount: 12 },
+        { category_id: categoryA2Id, amount: 8 },
+      ],
+    });
+    expect(error).toBeNull();
+    expect(await splitsFor(txnId as string)).toEqual([
+      { category_id: categoryA2Id, amount: 8 },
+      { category_id: categoryA1Id, amount: 12 },
+    ]);
+  });
+
+  it("(d) rpc_set_transaction_splits with a mismatched sum fails and leaves the original splits intact", async () => {
+    const { data: txnId, error: createErr } = await member.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: accountXId,
+        p_description: "Retro replace fail",
+        p_amount: 15,
+        p_date: today,
+        p_splits: [
+          { category_id: categoryA1Id, amount: 9 },
+          { category_id: categoryA2Id, amount: 6 },
+        ],
+      },
+    );
+    if (createErr) throw createErr;
+    const before = await splitsFor(txnId as string);
+
+    const { error } = await member.rpc("rpc_set_transaction_splits", {
+      p_transaction_id: txnId as string,
+      p_splits: [
+        { category_id: categoryA1Id, amount: 5 },
+        { category_id: categoryA2Id, amount: 3 },
+      ],
+    });
+    expect(error).not.toBeNull();
+    expect(await splitsFor(txnId as string)).toEqual(before);
+  });
+
+  it("(e) a Member cannot rpc_set_transaction_splits on a transaction in a Budget they cannot access", async () => {
+    const { data: txnId, error: createErr } = await parentA.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: accountYId,
+        p_description: "Budget Y txn",
+        p_amount: 10,
+        p_date: today,
+      },
+    );
+    if (createErr) throw createErr;
+
+    const { error } = await member.rpc("rpc_set_transaction_splits", {
+      p_transaction_id: txnId as string,
+      p_splits: [{ category_id: null, amount: 10 }],
+    });
+    expect(error).not.toBeNull();
+    // Original single split untouched.
+    expect(await splitsFor(txnId as string)).toEqual([
+      { category_id: null, amount: 10 },
+    ]);
+  });
+
+  it("(f) unauthenticated calls to either split RPC fail outright", async () => {
+    const { error: createErr } = await anon.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: "anon split",
+      p_amount: 10,
+      p_date: today,
+      p_splits: [{ category_id: null, amount: 10 }],
+    });
+    expect(createErr).not.toBeNull();
+
+    const { error: setErr } = await anon.rpc("rpc_set_transaction_splits", {
+      p_transaction_id: "00000000-0000-0000-0000-000000000000",
+      p_splits: [{ category_id: null, amount: 10 }],
+    });
+    expect(setErr).not.toBeNull();
+  });
+
+  it("(g) a split referencing a category from a different household is rejected by both write paths", async () => {
+    const { error: createErr } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: "cross-household split create",
+      p_amount: 10,
+      p_date: today,
+      p_splits: [{ category_id: categoryBId, amount: 10 }],
+    });
+    expect(createErr).not.toBeNull();
+
+    const { data: txnId, error: seedErr } = await member.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: accountXId,
+        p_description: "cross-household split retro seed",
+        p_amount: 10,
+        p_date: today,
+      },
+    );
+    if (seedErr) throw seedErr;
+
+    const { error: setErr } = await member.rpc("rpc_set_transaction_splits", {
+      p_transaction_id: txnId as string,
+      p_splits: [{ category_id: categoryBId, amount: 10 }],
+    });
+    expect(setErr).not.toBeNull();
+    expect(await splitsFor(txnId as string)).toEqual([
+      { category_id: null, amount: 10 },
+    ]);
+  });
+
+  it("(h) direct (service-role) split rows whose sum != the parent amount are rejected by the deferred constraint trigger", async () => {
+    const { data: txnId, error: seedErr } = await member.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: accountXId,
+        p_description: "deferred trigger seed",
+        p_amount: 10,
+        p_date: today,
+      },
+    );
+    if (seedErr) throw seedErr;
+
+    // Parent transaction already has one split of 10; adding another (null
+    // category, so the category-scope trigger is a no-op) makes the sum 15.
+    const { error } = await admin.from("transaction_split").insert({
+      transaction_id: txnId as string,
+      category_id: null,
+      amount: 5,
+    });
+    expect(error).not.toBeNull();
+    expect(await splitsFor(txnId as string)).toEqual([
+      { category_id: null, amount: 10 },
+    ]);
+  });
+
+  it("(i) direct (service-role) split row with a cross-household category is rejected by fn_validate_transaction_split_category_scope", async () => {
+    const { data: txnId, error: seedErr } = await member.rpc(
+      "rpc_create_transaction",
+      {
+        p_account_id: accountXId,
+        p_description: "category-scope trigger seed",
+        p_amount: 10,
+        p_date: today,
+      },
+    );
+    if (seedErr) throw seedErr;
+
+    const { error } = await admin.from("transaction_split").insert({
+      transaction_id: txnId as string,
+      category_id: categoryBId,
+      amount: 10,
+    });
+    expect(error).not.toBeNull();
+  });
+});

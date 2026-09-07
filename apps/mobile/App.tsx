@@ -28,7 +28,8 @@ type Screen =
   | "account"
   | "security"
   | "create-account"
-  | "create-transaction";
+  | "create-transaction"
+  | "transaction-list";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
@@ -36,6 +37,15 @@ type Direction = "expense" | "income";
 type Budget = { id: string; name: string; default_currency: string | null };
 type TxnAccount = { id: string; name: string };
 type TxnCategory = { id: string; name: string };
+type SplitRow = { categoryId: string; amount: string };
+type TxnListItem = {
+  id: string;
+  description: string;
+  amount: number;
+  date: string;
+  direction: string;
+  transaction_split: { id: string; category_id: string | null; amount: number }[];
+};
 
 // After any successful full authentication (signup, password-only signin,
 // or a signin's MFA challenge/verify step), persist the session for future
@@ -110,6 +120,16 @@ export default function App() {
   const [txnTime, setTxnTime] = useState("");
   const [txnStore, setTxnStore] = useState("");
   const [txnCategoryId, setTxnCategoryId] = useState("");
+  // AC1: split mode lets the user enter multiple category/amount pairs.
+  const [txnSplitMode, setTxnSplitMode] = useState(false);
+  const [txnSplits, setTxnSplits] = useState<SplitRow[]>([
+    { categoryId: "", amount: "" },
+    { categoryId: "", amount: "" },
+  ]);
+  const [txnListItems, setTxnListItems] = useState<TxnListItem[]>([]);
+  const [txnEditingId, setTxnEditingId] = useState<string | null>(null);
+  const [txnEditRows, setTxnEditRows] = useState<SplitRow[]>([]);
+  const [txnEditAmount, setTxnEditAmount] = useState(0);
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -430,13 +450,29 @@ export default function App() {
     if (categoryData) setTxnCategories(categoryData);
   }
 
+  function splitsTotal(rows: SplitRow[]) {
+    return rows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
+  }
+
   async function handleCreateTransaction() {
-    setSubmitting(true);
     setError(null);
+
+    if (
+      txnSplitMode &&
+      Math.abs(splitsTotal(txnSplits) - Number(txnAmount)) > 1e-9
+    ) {
+      // Client-side feedback only — the RPC + deferred constraint trigger are
+      // the authoritative check (AC2/AC5).
+      setError("Split amounts must add up to the transaction amount.");
+      return;
+    }
+
+    setSubmitting(true);
     await touchActivity();
 
     // p_budget_id is intentionally never sent — the RPC derives it from the
-    // referenced account server-side (AC5).
+    // referenced account server-side (AC5). In split mode p_category_id is
+    // omitted and p_splits carries the category/amount pairs.
     const { error: createError } = await supabase.rpc("rpc_create_transaction", {
       p_account_id: txnAccountId,
       p_description: txnDescription,
@@ -445,13 +481,19 @@ export default function App() {
       p_direction: txnDirection,
       p_time: txnTime || null,
       p_store: txnStore || null,
-      p_category_id: txnCategoryId || null,
+      p_category_id: txnSplitMode ? null : txnCategoryId || null,
+      p_splits: txnSplitMode
+        ? txnSplits.map((row) => ({
+            category_id: row.categoryId || null,
+            amount: Number(row.amount),
+          }))
+        : null,
     });
 
     if (createError) {
       // Never surface raw Supabase/Postgres error text (Secure Coding
       // obligation 10) — e.g. "not authorized for this budget" or a
-      // validation rejection.
+      // sum-validation rejection.
       setError("We couldn't save that transaction. Please try again.");
       setSubmitting(false);
       return;
@@ -464,7 +506,61 @@ export default function App() {
     setTxnTime("");
     setTxnStore("");
     setTxnCategoryId("");
+    setTxnSplitMode(false);
+    setTxnSplits([
+      { categoryId: "", amount: "" },
+      { categoryId: "", amount: "" },
+    ]);
     setScreen("dashboard");
+  }
+
+  async function loadTransactionList() {
+    const { data: categoryData } = await supabase
+      .from("category")
+      .select("id, name")
+      .eq("is_deleted", false);
+    if (categoryData) setTxnCategories(categoryData);
+
+    const { data } = await supabase
+      .from("transaction")
+      .select(
+        "id, description, amount, date, direction, transaction_split(id, category_id, amount)",
+      )
+      .eq("is_deleted", false)
+      .order("date", { ascending: false })
+      .limit(25);
+    if (data) setTxnListItems(data as unknown as TxnListItem[]);
+    setTxnEditingId(null);
+  }
+
+  async function handleSetSplits(transactionId: string) {
+    setError(null);
+    if (Math.abs(splitsTotal(txnEditRows) - txnEditAmount) > 1e-9) {
+      setError("Split amounts must add up to the transaction amount.");
+      return;
+    }
+
+    setSubmitting(true);
+    await touchActivity();
+
+    // p_amount is never sent — rpc_set_transaction_splits reads the
+    // transaction's own amount server-side (AC3/AC5).
+    const { error: rpcError } = await supabase.rpc("rpc_set_transaction_splits", {
+      p_transaction_id: transactionId,
+      p_splits: txnEditRows.map((row) => ({
+        category_id: row.categoryId || null,
+        amount: Number(row.amount),
+      })),
+    });
+
+    if (rpcError) {
+      setError("We couldn't update those splits. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    await loadTransactionList();
   }
 
   async function handleSendInvite() {
@@ -942,19 +1038,103 @@ export default function App() {
           onChangeText={setTxnStore}
         />
 
-        <Pressable
-          onPress={() => {
-            if (txnCategories.length === 0) return;
-            const idx = txnCategories.findIndex((c) => c.id === txnCategoryId);
-            // Cycle: Uncategorized -> cat[0] -> cat[1] -> ... -> Uncategorized.
-            const next = idx === txnCategories.length - 1 ? null : txnCategories[idx + 1];
-            setTxnCategoryId(next ? next.id : "");
-          }}
-        >
+        <Pressable onPress={() => setTxnSplitMode(!txnSplitMode)}>
           <Text style={styles.link}>
-            Category: {selectedCategory?.name ?? "Uncategorized"} (tap to change)
+            Split across multiple categories: {txnSplitMode ? "on" : "off"} (tap
+            to toggle)
           </Text>
         </Pressable>
+
+        {!txnSplitMode && (
+          <Pressable
+            onPress={() => {
+              if (txnCategories.length === 0) return;
+              const idx = txnCategories.findIndex((c) => c.id === txnCategoryId);
+              // Cycle: Uncategorized -> cat[0] -> cat[1] -> ... -> Uncategorized.
+              const next =
+                idx === txnCategories.length - 1 ? null : txnCategories[idx + 1];
+              setTxnCategoryId(next ? next.id : "");
+            }}
+          >
+            <Text style={styles.link}>
+              Category: {selectedCategory?.name ?? "Uncategorized"} (tap to
+              change)
+            </Text>
+          </Pressable>
+        )}
+
+        {txnSplitMode && (
+          <View style={{ width: "100%", gap: 8 }}>
+            {txnSplits.map((row, index) => {
+              const rowCat = txnCategories.find((c) => c.id === row.categoryId);
+              return (
+                <View key={index} style={{ gap: 4 }}>
+                  <Pressable
+                    onPress={() => {
+                      const idx = txnCategories.findIndex(
+                        (c) => c.id === row.categoryId,
+                      );
+                      const next =
+                        idx === txnCategories.length - 1
+                          ? null
+                          : txnCategories[idx + 1];
+                      setTxnSplits((rows) =>
+                        rows.map((r, i) =>
+                          i === index
+                            ? { ...r, categoryId: next ? next.id : "" }
+                            : r,
+                        ),
+                      );
+                    }}
+                  >
+                    <Text style={styles.link}>
+                      Split {index + 1} category:{" "}
+                      {rowCat?.name ?? "Uncategorized"} (tap to change)
+                    </Text>
+                  </Pressable>
+                  <TextInput
+                    style={styles.input}
+                    placeholder={`Split ${index + 1} amount`}
+                    value={row.amount}
+                    onChangeText={(text) =>
+                      setTxnSplits((rows) =>
+                        rows.map((r, i) =>
+                          i === index ? { ...r, amount: text } : r,
+                        ),
+                      )
+                    }
+                    keyboardType="numeric"
+                  />
+                  {txnSplits.length > 1 && (
+                    <Pressable
+                      onPress={() =>
+                        setTxnSplits((rows) =>
+                          rows.filter((_, i) => i !== index),
+                        )
+                      }
+                    >
+                      <Text style={styles.link}>Remove split {index + 1}</Text>
+                    </Pressable>
+                  )}
+                </View>
+              );
+            })}
+            <Pressable
+              onPress={() =>
+                setTxnSplits((rows) => [
+                  ...rows,
+                  { categoryId: "", amount: "" },
+                ])
+              }
+            >
+              <Text style={styles.link}>Add split</Text>
+            </Pressable>
+            <Text>
+              Split total: {splitsTotal(txnSplits).toFixed(2)}
+              {txnAmount !== "" && ` / ${Number(txnAmount).toFixed(2)}`}
+            </Text>
+          </View>
+        )}
 
         {error && <Text style={styles.error}>{error}</Text>}
 
@@ -966,6 +1146,152 @@ export default function App() {
 
         <Pressable onPress={() => setScreen("dashboard")}>
           <Text style={styles.link}>Cancel</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
+  if (screen === "transaction-list") {
+    const categoryName = (id: string | null) =>
+      id
+        ? (txnCategories.find((c) => c.id === id)?.name ?? "—")
+        : "Uncategorized";
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Transactions</Text>
+
+        {txnListItems.length === 0 && <Text>No transactions yet.</Text>}
+
+        {txnListItems.map((item) => (
+          <View
+            key={item.id}
+            style={{
+              width: "100%",
+              borderWidth: 1,
+              borderColor: "#ccc",
+              borderRadius: 6,
+              padding: 10,
+              gap: 4,
+            }}
+          >
+            <Text style={{ fontWeight: "600" }}>
+              {item.description} — {item.direction === "income" ? "+" : "−"}
+              {item.amount.toFixed(2)}
+            </Text>
+            <Text style={{ color: "#666", fontSize: 12 }}>{item.date}</Text>
+            {item.transaction_split.map((split) => (
+              <Text key={split.id}>
+                {categoryName(split.category_id)}: {split.amount.toFixed(2)}
+              </Text>
+            ))}
+
+            {txnEditingId === item.id ? (
+              <View style={{ gap: 4 }}>
+                {txnEditRows.map((row, index) => {
+                  const rowCat = txnCategories.find(
+                    (c) => c.id === row.categoryId,
+                  );
+                  return (
+                    <View key={index} style={{ gap: 4 }}>
+                      <Pressable
+                        onPress={() => {
+                          const idx = txnCategories.findIndex(
+                            (c) => c.id === row.categoryId,
+                          );
+                          const next =
+                            idx === txnCategories.length - 1
+                              ? null
+                              : txnCategories[idx + 1];
+                          setTxnEditRows((rows) =>
+                            rows.map((r, i) =>
+                              i === index
+                                ? { ...r, categoryId: next ? next.id : "" }
+                                : r,
+                            ),
+                          );
+                        }}
+                      >
+                        <Text style={styles.link}>
+                          Split {index + 1}: {rowCat?.name ?? "Uncategorized"}{" "}
+                          (tap to change)
+                        </Text>
+                      </Pressable>
+                      <TextInput
+                        style={styles.input}
+                        placeholder={`Split ${index + 1} amount`}
+                        value={row.amount}
+                        onChangeText={(text) =>
+                          setTxnEditRows((rows) =>
+                            rows.map((r, i) =>
+                              i === index ? { ...r, amount: text } : r,
+                            ),
+                          )
+                        }
+                        keyboardType="numeric"
+                      />
+                      {txnEditRows.length > 1 && (
+                        <Pressable
+                          onPress={() =>
+                            setTxnEditRows((rows) =>
+                              rows.filter((_, i) => i !== index),
+                            )
+                          }
+                        >
+                          <Text style={styles.link}>Remove split {index + 1}</Text>
+                        </Pressable>
+                      )}
+                    </View>
+                  );
+                })}
+                <Pressable
+                  onPress={() =>
+                    setTxnEditRows((rows) => [
+                      ...rows,
+                      { categoryId: "", amount: "" },
+                    ])
+                  }
+                >
+                  <Text style={styles.link}>Add split</Text>
+                </Pressable>
+                <Text>
+                  Split total: {splitsTotal(txnEditRows).toFixed(2)} /{" "}
+                  {item.amount.toFixed(2)}
+                </Text>
+                <Button
+                  title={submitting ? "Saving…" : "Save splits"}
+                  onPress={() => handleSetSplits(item.id)}
+                  disabled={submitting}
+                />
+                <Pressable onPress={() => setTxnEditingId(null)}>
+                  <Text style={styles.link}>Cancel</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Pressable
+                onPress={() => {
+                  setError(null);
+                  setTxnEditingId(item.id);
+                  setTxnEditAmount(item.amount);
+                  setTxnEditRows(
+                    item.transaction_split.map((split) => ({
+                      categoryId: split.category_id ?? "",
+                      amount: String(split.amount),
+                    })),
+                  );
+                }}
+              >
+                <Text style={styles.link}>Split / edit categories</Text>
+              </Pressable>
+            )}
+          </View>
+        ))}
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Pressable onPress={() => setScreen("dashboard")}>
+          <Text style={styles.link}>Back to dashboard</Text>
         </Pressable>
 
         <StatusBar style="auto" />
@@ -1039,6 +1365,14 @@ export default function App() {
             setError(null);
             await loadTransactionData();
             setScreen("create-transaction");
+          }}
+        />
+        <Button
+          title="View transactions"
+          onPress={async () => {
+            setError(null);
+            await loadTransactionList();
+            setScreen("transaction-list");
           }}
         />
         <Button
