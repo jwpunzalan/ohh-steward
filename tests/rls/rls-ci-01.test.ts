@@ -314,6 +314,127 @@ describe("RLS-CI-01: budget tenant isolation", () => {
     expect(canAccessErr).toBeNull();
     expect(canAccess).toBe(true);
   });
+
+  // STEW-38 AC1/AC2: Account join-path isolation. Story 3.1 covered the
+  // Transaction side; the `account` table itself had no direct-query
+  // isolation test. Account RLS is `for all using (can_access_budget(budget_id))`
+  // — verified live, unchanged by this DIP; these are the missing regression
+  // tests for that existing, correct behavior.
+  it("STEW-38: a Member's direct account query is scoped to Budgets they can access", async () => {
+    const { data: acctX, error: acctXErr } = await memberB.rpc(
+      "rpc_create_account",
+      {
+        p_budget_id: budgetXId,
+        p_type: "account",
+        p_name: "STEW-38 Budget X account",
+        p_currency: "USD",
+        p_opening_balance: 0,
+      },
+    );
+    if (acctXErr) throw acctXErr;
+    const acctXId = acctX as string;
+
+    const { data: acctY, error: acctYErr } = await parentA.rpc(
+      "rpc_create_account",
+      {
+        p_budget_id: budgetYId,
+        p_type: "account",
+        p_name: "STEW-38 Budget Y account",
+        p_currency: "USD",
+        p_opening_balance: 0,
+      },
+    );
+    if (acctYErr) throw acctYErr;
+    const acctYId = acctY as string;
+
+    // (b) Member B sees Budget X's account, never Budget Y's — via a direct
+    // table query, no RPC.
+    const { data: memberBAccounts, error: readErr } = await memberB
+      .from("account")
+      .select("id");
+    expect(readErr).toBeNull();
+    const memberBIds = (memberBAccounts ?? []).map((r) => r.id);
+    expect(memberBIds).toContain(acctXId);
+    expect(memberBIds).not.toContain(acctYId);
+
+    // (c) Member C (no Budget access at all) sees no account rows.
+    const { data: memberCAccounts, error: memberCErr } = await memberC
+      .from("account")
+      .select("id");
+    expect(memberCErr).toBeNull();
+    expect(memberCAccounts ?? []).toHaveLength(0);
+
+    // (d) Member B's UPDATE of Budget Y's account is filtered out by RLS —
+    // zero rows affected, no thrown error (same pattern as the `budget`
+    // isolation tests above).
+    const { data: updated, error: updateErr } = await memberB
+      .from("account")
+      .update({ name: "hijacked" })
+      .eq("id", acctYId)
+      .select();
+    expect(updateErr).toBeNull();
+    expect(updated ?? []).toHaveLength(0);
+
+    const { data: unchanged } = await admin
+      .from("account")
+      .select("name")
+      .eq("id", acctYId)
+      .single();
+    expect(unchanged?.name).toBe("STEW-38 Budget Y account");
+  });
+
+  // STEW-38 AC3: DVP §3's "as unauthenticated: any query — must fail" is
+  // broader than the RPC-grant denial covered elsewhere — it means a direct
+  // table query too. The table SELECT grant exists (Supabase default,
+  // PostgREST needs it), so denial happens at the RLS layer. Post the STEW-33
+  // hardening batch, every Budget/household-scoped table's policy calls a
+  // SECURITY DEFINER helper (is_household_parent / can_access_budget /
+  // is_household_member) that anon can no longer EXECUTE, so the query now
+  // fails outright with a permission error rather than returning []. Either
+  // way the requirement is the same and is what this asserts: no row ever
+  // leaks to an unauthenticated caller.
+  it("STEW-38: an unauthenticated client's direct table queries never return rows", async () => {
+    const anon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+
+    for (const table of ["budget", "account", "category", "transaction"]) {
+      const { data, error } = await anon.from(table).select("id");
+      // No data is the invariant. If the query errored, it must be a denial
+      // (permission denied — 42501), never a leak or an unexpected failure.
+      expect(data ?? []).toHaveLength(0);
+      if (error) expect(error.code).toBe("42501");
+    }
+  });
+
+  // STEW-38 AC4: DVP §3 names "Budget name" as a required SQL-metacharacter
+  // literal-storage case (only Transaction description/store was covered, by
+  // Story 3.1). Mirrors that test's shape.
+  it("STEW-38: a SQL metacharacter in a Budget name is stored and retrieved literally", async () => {
+    const payload = "' OR '1'='1";
+    const { data: budgetId, error } = await parentA.rpc("rpc_create_budget", {
+      p_name: payload,
+      p_period_type: "monthly",
+      p_owner_member_ids: [],
+    });
+    expect(error).toBeNull();
+
+    const { data: row } = await parentA
+      .from("budget")
+      .select("name")
+      .eq("id", budgetId as string)
+      .single();
+    expect(row?.name).toBe(payload);
+
+    // The literal never widened the result set — the caller still only sees
+    // Budgets they can access, and exactly one matches the payload name.
+    const { data: matches, error: matchErr } = await parentA
+      .from("budget")
+      .select("id")
+      .eq("name", payload);
+    expect(matchErr).toBeNull();
+    expect(matches).toHaveLength(1);
+  });
 });
 
 /**
@@ -572,6 +693,42 @@ describe("RLS-CI-01: category household-scoped access", () => {
       { p_id: toDelete as string },
     );
     expect(secondDeleteErr).not.toBeNull();
+  });
+
+  // STEW-38 AC4: DVP §3 names "Category name" as a required SQL-metacharacter
+  // literal-storage case — previously only Transaction description/store was
+  // covered (Story 3.1). Mirrors that test's shape.
+  it("STEW-38: a SQL metacharacter in a Category name is stored and retrieved literally", async () => {
+    const payload = "' OR '1'='1";
+    const { data: categoryId, error } = await parentA.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: payload,
+    });
+    expect(error).toBeNull();
+
+    const { data: row } = await parentA
+      .from("category")
+      .select("name")
+      .eq("id", categoryId as string)
+      .single();
+    expect(row?.name).toBe(payload);
+
+    // The literal never widened the result set — the member of household A
+    // still sees only household A's categories, and exactly one matches.
+    const { data: aMatches, error: aErr } = await member
+      .from("category")
+      .select("id")
+      .eq("name", payload);
+    expect(aErr).toBeNull();
+    expect(aMatches).toHaveLength(1);
+
+    // ...and parentB (household B) never sees household A's metacharacter row.
+    const { data: bMatches, error: bErr } = await parentB
+      .from("category")
+      .select("id")
+      .eq("name", payload);
+    expect(bErr).toBeNull();
+    expect(bMatches ?? []).toHaveLength(0);
   });
 });
 
