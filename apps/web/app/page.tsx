@@ -25,74 +25,82 @@ export default function AuthPage() {
     setSubmitting(true);
     setError(null);
 
-    const supabase = createClient();
+    try {
+      const supabase = createClient();
 
-    if (mode === "signup") {
-      // Household bootstrap happens server-side via a database trigger on
-      // auth.users (Story 1.1.G2) — unconditionally, at account-creation
-      // time, regardless of whether email confirmation is required. No
-      // client-side bootstrap call exists: under mandatory email
-      // confirmation (this project's actual configuration), signUp()
-      // returns session: null until the user confirms, so any call
-      // requiring an authenticated session would run as anon and fail.
-      const { data, error: signUpError } = await supabase.auth.signUp({
-        email,
-        password,
-      });
-      if (signUpError) {
-        // Never surface raw Supabase/Postgres error text (Secure Coding
-        // obligation 10) — e.g. Supabase Auth's native duplicate-email error.
-        setError("We couldn't create your account. Please try again.");
-        setSubmitting(false);
-        return;
-      }
-
-      if (!data.session) {
-        setSubmitting(false);
-        setCheckEmail(true);
-        return;
-      }
-    } else {
-      // AC1: any device with no valid stored session always goes through
-      // the full flow — password, then MFA challenge if the user has 2FA
-      // enrolled — never a shortcut.
-      const { error: signInError } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
-      if (signInError) {
-        setError("Invalid email or password.");
-        setSubmitting(false);
-        return;
-      }
-
-      const { data: aal } =
-        await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
-      if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
-        const { data: factors, error: factorsError } =
-          await supabase.auth.mfa.listFactors();
-        const factor = factors?.totp?.[0];
-        if (factorsError || !factor) {
-          setError("We couldn't complete sign-in. Please try again.");
+      if (mode === "signup") {
+        // Household bootstrap happens server-side via a database trigger on
+        // auth.users (Story 1.1.G2) — unconditionally, at account-creation
+        // time, regardless of whether email confirmation is required. No
+        // client-side bootstrap call exists: under mandatory email
+        // confirmation (this project's actual configuration), signUp()
+        // returns session: null until the user confirms, so any call
+        // requiring an authenticated session would run as anon and fail.
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email,
+          password,
+        });
+        if (signUpError) {
+          // Never surface raw Supabase/Postgres error text (Secure Coding
+          // obligation 10) — e.g. Supabase Auth's native duplicate-email error.
+          setError("We couldn't create your account. Please try again.");
           setSubmitting(false);
           return;
         }
-        const { data: challenge, error: challengeError } =
-          await supabase.auth.mfa.challenge({ factorId: factor.id });
-        if (challengeError || !challenge) {
-          setError("We couldn't complete sign-in. Please try again.");
+
+        if (!data.session) {
+          setSubmitting(false);
+          setCheckEmail(true);
+          return;
+        }
+      } else {
+        // AC1: any device with no valid stored session always goes through
+        // the full flow — password, then MFA challenge if the user has 2FA
+        // enrolled — never a shortcut.
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+        if (signInError) {
+          setError("Invalid email or password.");
           setSubmitting(false);
           return;
         }
-        setMfaFactorId(factor.id);
-        setMfaChallengeId(challenge.id);
-        setSubmitting(false);
-        setStep("mfa-challenge");
-        return;
+
+        const { data: aal } =
+          await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+        if (aal && aal.nextLevel === "aal2" && aal.currentLevel !== "aal2") {
+          const { data: factors, error: factorsError } =
+            await supabase.auth.mfa.listFactors();
+          const factor = factors?.totp?.[0];
+          if (factorsError || !factor) {
+            setError("We couldn't complete sign-in. Please try again.");
+            setSubmitting(false);
+            return;
+          }
+          const { data: challenge, error: challengeError } =
+            await supabase.auth.mfa.challenge({ factorId: factor.id });
+          if (challengeError || !challenge) {
+            setError("We couldn't complete sign-in. Please try again.");
+            setSubmitting(false);
+            return;
+          }
+          setMfaFactorId(factor.id);
+          setMfaChallengeId(challenge.id);
+          setSubmitting(false);
+          setStep("mfa-challenge");
+          return;
+        }
       }
+
+      router.push("/dashboard");
+    } catch {
+      // STEW-36: a thrown exception (not a normal { error } result) — e.g.
+      // createClient() failing, a network exception — must never leave the
+      // form permanently stuck submitting. Generic message only (obligation 10).
+      setError("Something went wrong. Please try again.");
+      setSubmitting(false);
     }
-
-    router.push("/dashboard");
   }
 
   if (checkEmail) {
@@ -124,20 +132,26 @@ export default function AuthPage() {
     setSubmitting(true);
     setError(null);
 
-    const supabase = createClient();
-    const { error: verifyError } = await supabase.auth.mfa.verify({
-      factorId: mfaFactorId,
-      challengeId: mfaChallengeId,
-      code: mfaCode,
-    });
+    try {
+      const supabase = createClient();
+      const { error: verifyError } = await supabase.auth.mfa.verify({
+        factorId: mfaFactorId,
+        challengeId: mfaChallengeId,
+        code: mfaCode,
+      });
 
-    if (verifyError) {
-      setError("Invalid code. Please try again.");
+      if (verifyError) {
+        setError("Invalid code. Please try again.");
+        setSubmitting(false);
+        return;
+      }
+
+      router.push("/dashboard");
+    } catch {
+      // STEW-36: see handleSubmit — a thrown exception must not strand the form.
+      setError("We couldn't verify that code. Please try again.");
       setSubmitting(false);
-      return;
     }
-
-    router.push("/dashboard");
   }
 
   if (step === "mfa-challenge") {
