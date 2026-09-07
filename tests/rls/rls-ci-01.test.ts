@@ -1734,3 +1734,368 @@ describe("RLS-CI-01: budget period & category limit access", () => {
     }
   });
 });
+
+/**
+ * DIP-5.2 (Story 5.2) — `transfer` RLS + surplus-transfer coverage. The DIP's
+ * Grounding Check (Convention 5) commits to this per IMPLEMENTATION_CONVENTIONS
+ * item 5 ("a committed deliverable, never deferred"); the block spec was
+ * omitted from the DIP body, so it is written here to the Grounding Check's
+ * stated shape. Covers: transfer SELECT isolation, the deliberate absence of
+ * any client write path, unauthenticated denial (Convention 7), the two new
+ * DB-layer validation triggers on budget.surplus_destination_id (AC6), the
+ * end-to-end surplus-transfer created by rollover (AC1), the duplicate guard
+ * (AC5), and the multi-currency no-op (AC7).
+ */
+describe("RLS-CI-01: envelope surplus transfer", () => {
+  const admin = adminClient();
+  const trRunId = `${runId}-transfer`;
+  const today = new Date().toISOString().slice(0, 10);
+
+  let parentAId: string;
+  let memberId: string;
+
+  let householdAId: string;
+  let budgetXId: string; // Member-owned, single-currency
+  let budgetYId: string; // Parent-only
+  let periodXId: string; // Budget X's bootstrapped first period
+  let destAccountXId: string; // non-credit-card account in Budget X (the destination)
+  let ccAccountXId: string; // a credit_card account in Budget X
+  let accountYId: string; // an account in Budget Y
+  let categoryA1Id: string;
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+  const anon: SupabaseClient = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${trRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${trRunId}-member@example.com`;
+
+    for (const [email, assign] of [
+      [parentAEmail, (id: string) => (parentAId = id)],
+      [memberEmail, (id: string) => (memberId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+
+    const { data: parentAMember, error: pErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (pErr) throw pErr;
+    householdAId = parentAMember.household_id as string;
+
+    const { data: memberRows, error: mErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId)
+      .select("id");
+    if (mErr) throw mErr;
+    const memberMemberId = memberRows![0].id as string;
+
+    const { data: bx, error: bxErr } = await member.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Transfer Budget X",
+      p_period_type: "monthly",
+      p_owner_member_ids: [memberMemberId],
+    });
+    if (bxErr) throw bxErr;
+    budgetXId = bx as string;
+
+    const { data: by, error: byErr } = await parentA.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Transfer Budget Y",
+      p_period_type: "monthly",
+      p_owner_member_ids: [],
+    });
+    if (byErr) throw byErr;
+    budgetYId = by as string;
+
+    const { data: pX } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", budgetXId)
+      .single();
+    periodXId = pX!.id as string;
+
+    const mkAccount = async (
+      client: SupabaseClient,
+      budgetId: string,
+      name: string,
+      type: string,
+      currency: string,
+      extra: Record<string, unknown> = {},
+    ) => {
+      const { data, error } = await client.rpc("rpc_create_account", {
+        p_budget_id: budgetId,
+        p_type: type,
+        p_name: name,
+        p_currency: currency,
+        p_opening_balance: 0,
+        ...extra,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+    destAccountXId = await mkAccount(member, budgetXId, "Dest Savings", "savings", "USD");
+    ccAccountXId = await mkAccount(member, budgetXId, "Card", "credit_card", "USD", {
+      p_credit_limit: 1000,
+    });
+    accountYId = await mkAccount(parentA, budgetYId, "Y Checking", "account", "USD");
+
+    const { data: cat, error: catErr } = await parentA.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: "Transfer Cat",
+    });
+    if (catErr) throw catErr;
+    categoryA1Id = cat as string;
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("AC6: surplus_destination_id rejects a credit_card account and an account from another Budget", async () => {
+    const { error: ccErr } = await member
+      .from("budget")
+      .update({ surplus_destination_id: ccAccountXId })
+      .eq("id", budgetXId);
+    expect(ccErr).not.toBeNull();
+
+    const { error: crossErr } = await member
+      .from("budget")
+      .update({ surplus_destination_id: accountYId })
+      .eq("id", budgetXId);
+    expect(crossErr).not.toBeNull();
+
+    const { data: row } = await admin
+      .from("budget")
+      .select("surplus_destination_id")
+      .eq("id", budgetXId)
+      .single();
+    expect(row?.surplus_destination_id).toBeNull();
+  });
+
+  it("a Member cannot directly write a transfer row (no client write policy exists)", async () => {
+    const { error } = await member.from("transfer").insert({
+      budget_period_id: periodXId,
+      destination_account_id: destAccountXId,
+      amount: 1,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("AC1/AC5/AC7: rollover creates exactly one surplus transfer and credits the destination once", async () => {
+    // Configure a valid single-currency destination + a limit with zero spend.
+    const { error: setDestErr } = await member
+      .from("budget")
+      .update({ surplus_destination_id: destAccountXId })
+      .eq("id", budgetXId);
+    expect(setDestErr).toBeNull();
+
+    const { error: limErr } = await member.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: periodXId,
+      p_category_id: categoryA1Id,
+      p_limit_amount: 120,
+    });
+    if (limErr) throw limErr;
+
+    // Close Budget X's first period (service-role: no client write path).
+    const { error: closeErr } = await admin
+      .from("budget_period")
+      .update({ period_start: "2020-01-01", period_end: "2020-01-31" })
+      .eq("id", periodXId);
+    if (closeErr) throw closeErr;
+
+    const { error: rollErr } = await admin.rpc("fn_rollover_budget_periods");
+    expect(rollErr).toBeNull();
+
+    const { data: transfers } = await admin
+      .from("transfer")
+      .select("id, amount, destination_account_id")
+      .eq("budget_period_id", periodXId);
+    expect(transfers).toHaveLength(1);
+    expect(Number(transfers![0].amount)).toBe(120);
+    expect(transfers![0].destination_account_id).toBe(destAccountXId);
+
+    const { data: acct } = await admin
+      .from("account")
+      .select("current_balance")
+      .eq("id", destAccountXId)
+      .single();
+    expect(Number(acct?.current_balance)).toBe(120);
+
+    // AC5: a second direct surplus-transfer attempt for the same period is
+    // blocked by uq_transfer_period; the balance is not credited again.
+    const { error: dupErr } = await admin.rpc("fn_create_surplus_transfer", {
+      p_budget_id: budgetXId,
+      p_closing_period_id: periodXId,
+    });
+    expect(dupErr).not.toBeNull();
+
+    const { data: acct2 } = await admin
+      .from("account")
+      .select("current_balance")
+      .eq("id", destAccountXId)
+      .single();
+    expect(Number(acct2?.current_balance)).toBe(120);
+
+    // Transfer is visible to the owner via RLS, not to an outsider.
+    const { data: memberView } = await member
+      .from("transfer")
+      .select("id")
+      .eq("budget_period_id", periodXId);
+    expect((memberView ?? []).map((r) => r.id)).toContain(transfers![0].id);
+  });
+
+  it("AC7: a multi-currency Budget produces no transfer and credits nothing", async () => {
+    // A fresh Budget with two account currencies.
+    const { data: memberRow } = await admin
+      .from("household_member")
+      .select("id")
+      .eq("auth_user_id", memberId)
+      .single();
+    const { data: bmc, error: bmcErr } = await member.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Multi-currency Budget",
+      p_period_type: "monthly",
+      p_owner_member_ids: [memberRow!.id],
+    });
+    if (bmcErr) throw bmcErr;
+    const mcBudgetId = bmc as string;
+
+    const mkAccount = async (name: string, currency: string) => {
+      const { data, error } = await member.rpc("rpc_create_account", {
+        p_budget_id: mcBudgetId,
+        p_type: "savings",
+        p_name: name,
+        p_currency: currency,
+        p_opening_balance: 0,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+    const usdDest = await mkAccount("MC USD", "USD");
+    await mkAccount("MC EUR", "EUR");
+
+    await member
+      .from("budget")
+      .update({ surplus_destination_id: usdDest })
+      .eq("id", mcBudgetId);
+
+    const { data: mcPeriod } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", mcBudgetId)
+      .single();
+    await member.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: mcPeriod!.id,
+      p_category_id: categoryA1Id,
+      p_limit_amount: 50,
+    });
+    await admin
+      .from("budget_period")
+      .update({ period_start: "2020-02-01", period_end: "2020-02-28" })
+      .eq("id", mcPeriod!.id);
+
+    const { error: rollErr } = await admin.rpc("fn_rollover_budget_periods");
+    expect(rollErr).toBeNull();
+
+    const { data: transfers } = await admin
+      .from("transfer")
+      .select("id")
+      .eq("budget_period_id", mcPeriod!.id);
+    expect(transfers ?? []).toHaveLength(0);
+
+    const { data: acct } = await admin
+      .from("account")
+      .select("current_balance")
+      .eq("id", usdDest)
+      .single();
+    expect(Number(acct?.current_balance)).toBe(0);
+  });
+
+  it("an unauthenticated client's direct query on transfer never returns rows", async () => {
+    const { data, error } = await anon.from("transfer").select("id");
+    expect(data ?? []).toHaveLength(0);
+    if (error) expect(error.code).toBe("42501");
+  });
+
+  // 5.1 regression found while implementing 5.2: fn_rollover_budget_periods
+  // advances one period per run, so a budget many periods behind opens
+  // intermediate periods whose period_end is already past. The 5.1 AC6
+  // open-period guard (BEFORE INSERT OR UPDATE) rejected the rollover's own
+  // copy-forward INSERT into such a period, and the outer per-budget
+  // exception block then rolled the whole savepoint back — that budget made
+  // zero progress on every run. Fixed in this migration via a
+  // transaction-local `app.rollover` flag the guard honours.
+  it("rollover advances a budget that is multiple periods behind, copying limits into each past period", async () => {
+    const { data: memberRow } = await admin
+      .from("household_member")
+      .select("id")
+      .eq("auth_user_id", memberId)
+      .single();
+    const { data: bhId, error: bhErr } = await member.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Catch-up Budget",
+      p_period_type: "monthly",
+      p_owner_member_ids: [memberRow!.id],
+    });
+    if (bhErr) throw bhErr;
+    const catchupBudgetId = bhId as string;
+
+    const { data: firstPeriod } = await admin
+      .from("budget_period")
+      .select("id")
+      .eq("budget_id", catchupBudgetId)
+      .single();
+
+    // Set a limit while the period is still open, then backdate it ~3 months.
+    const { error: limErr } = await member.rpc("rpc_upsert_category_limit", {
+      p_budget_period_id: firstPeriod!.id,
+      p_category_id: categoryA1Id,
+      p_limit_amount: 90,
+    });
+    if (limErr) throw limErr;
+    await admin
+      .from("budget_period")
+      .update({ period_start: "2020-01-01", period_end: "2020-01-31" })
+      .eq("id", firstPeriod!.id);
+
+    // First run: opens 2020-02 (a past period) and copies the limit forward
+    // — this is exactly the write the 5.1 guard used to reject.
+    let { error: r1 } = await admin.rpc("fn_rollover_budget_periods");
+    expect(r1).toBeNull();
+    // Second run: advances again to 2020-03.
+    let { error: r2 } = await admin.rpc("fn_rollover_budget_periods");
+    expect(r2).toBeNull();
+
+    const { data: periods } = await admin
+      .from("budget_period")
+      .select("id, period_start, period_end")
+      .eq("budget_id", catchupBudgetId)
+      .order("period_start");
+    expect((periods ?? []).length).toBe(3); // 2020-01, -02, -03 — progress each run
+
+    // Every opened period carries the copied-forward limit (90).
+    const { data: limits } = await admin
+      .from("category_limit")
+      .select("budget_period_id, limit_amount")
+      .in(
+        "budget_period_id",
+        (periods ?? []).map((p) => p.id),
+      );
+    expect((limits ?? []).length).toBe(3);
+    for (const l of limits ?? []) expect(Number(l.limit_amount)).toBe(90);
+  });
+});
