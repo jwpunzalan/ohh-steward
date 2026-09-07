@@ -38,6 +38,16 @@ type Direction = "expense" | "income";
 type Budget = { id: string; name: string; default_currency: string | null };
 type TxnAccount = { id: string; name: string };
 type TxnCategory = { id: string; name: string };
+type DashBudget = { id: string; name: string };
+type DashPeriod = { id: string; period_start: string; period_end: string };
+type CategoryState = {
+  budget_period_id: string;
+  budget_id: string;
+  category_id: string;
+  category_name: string;
+  limit_amount: number;
+  spent: number;
+};
 type SplitRow = { categoryId: string; amount: string };
 type TxnListItem = {
   id: string;
@@ -131,6 +141,13 @@ export default function App() {
   const [txnEditingId, setTxnEditingId] = useState<string | null>(null);
   const [txnEditRows, setTxnEditRows] = useState<SplitRow[]>([]);
   const [txnEditAmount, setTxnEditAmount] = useState(0);
+  // Story 6.1 dashboard: Budget picker, Period picker (index over an ordered
+  // array, no query per navigation click), and the Category-state list.
+  const [dashBudgets, setDashBudgets] = useState<DashBudget[]>([]);
+  const [dashBudgetId, setDashBudgetId] = useState("");
+  const [dashPeriods, setDashPeriods] = useState<DashPeriod[]>([]);
+  const [dashPeriodIndex, setDashPeriodIndex] = useState(0);
+  const [dashStates, setDashStates] = useState<CategoryState[]>([]);
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -167,6 +184,24 @@ export default function App() {
     });
     return () => subscription.remove();
   }, []);
+
+  // Story 6.1: load the dashboard's Budget picker whenever the dashboard is
+  // shown; then its Period picker for the selected Budget; then the
+  // Category-state list for the selected Period.
+  useEffect(() => {
+    if (screen === "dashboard") loadDashboardBudgets();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen]);
+
+  useEffect(() => {
+    if (dashBudgetId) loadDashboardPeriods(dashBudgetId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dashBudgetId]);
+
+  useEffect(() => {
+    loadCategoryStates(dashPeriods[dashPeriodIndex]?.id ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dashPeriods, dashPeriodIndex]);
 
   async function handleSubmit() {
     setSubmitting(true);
@@ -416,6 +451,59 @@ export default function App() {
         }
       }
     }
+  }
+
+  // Story 6.1 dashboard reads. Pure reads: no guardIdleOrSignOut (idle
+  // enforcement on read paths is handled by checkIdleAndSignOutIfElapsed on
+  // resume) — matches loadAccountBudgets / loadTransactionList exactly.
+  async function loadDashboardBudgets() {
+    const { data, error: budgetError } = await supabase
+      .from("budget")
+      .select("id, name")
+      .eq("is_deleted", false)
+      .order("name");
+    if (budgetError) {
+      setError("We couldn't load your dashboard. Please try again.");
+      return;
+    }
+    if (data) {
+      setDashBudgets(data);
+      if (data[0] && !data.some((b) => b.id === dashBudgetId)) {
+        setDashBudgetId(data[0].id);
+      }
+    }
+  }
+
+  async function loadDashboardPeriods(budgetId: string) {
+    setDashPeriodIndex(0);
+    const { data, error: periodError } = await supabase
+      .from("budget_period")
+      .select("id, period_start, period_end")
+      .eq("budget_id", budgetId)
+      .order("period_start", { ascending: false });
+    if (periodError) {
+      setError("We couldn't load your dashboard. Please try again.");
+      return;
+    }
+    setDashPeriods(data ?? []);
+  }
+
+  async function loadCategoryStates(periodId: string) {
+    if (!periodId) {
+      setDashStates([]);
+      return;
+    }
+    const { data, error: stateError } = await supabase
+      .from("v_category_period_state")
+      .select("*")
+      .eq("budget_period_id", periodId)
+      .order("category_name");
+    if (stateError) {
+      setError("We couldn't load your dashboard. Please try again.");
+      return;
+    }
+    setError(null);
+    setDashStates((data as CategoryState[]) ?? []);
   }
 
   async function handleCreateAccount() {
@@ -1389,66 +1477,124 @@ export default function App() {
   }
 
   if (screen === "dashboard") {
+    const dashPeriod = dashPeriods[dashPeriodIndex];
     return (
       <View style={styles.container}>
-        <Text style={styles.title}>Welcome to your household</Text>
-        <Text>
-          You don&apos;t have any budgets or categories yet. This is a
-          placeholder — later stories will build the real dashboard here.
-        </Text>
-        <Button
-          title="Create a budget"
+        <Text style={styles.title}>Dashboard</Text>
+
+        {/* AC1/AC3: Budget picker — RLS returns all household Budgets for a
+            Parent, only assigned Budgets for a Member; no client role logic. */}
+        <Pressable
           onPress={() => {
-            setError(null);
-            setScreen("create-budget");
+            if (dashBudgets.length === 0) return;
+            const idx = dashBudgets.findIndex((b) => b.id === dashBudgetId);
+            const next = dashBudgets[(idx + 1) % dashBudgets.length];
+            if (next) setDashBudgetId(next.id);
           }}
-        />
-        <Button
-          title="Add an account"
-          onPress={async () => {
-            setError(null);
-            await loadAccountBudgets();
-            setScreen("create-account");
-          }}
-        />
-        <Button
-          title="Add a transaction"
-          onPress={async () => {
-            setError(null);
-            await loadTransactionData();
-            setScreen("create-transaction");
-          }}
-        />
-        <Button
-          title="View transactions"
-          onPress={async () => {
-            setError(null);
-            await loadTransactionList();
-            setScreen("transaction-list");
-          }}
-        />
-        <Button
-          title="Invite someone to your household"
-          onPress={() => {
-            setError(null);
-            setInviteSent(false);
-            setScreen("invite-send");
-          }}
-        />
-        <Button
-          title="Account"
-          onPress={() => {
-            setError(null);
-            setScreen("account");
-          }}
-        />
-        <Button
-          title="Security"
-          onPress={() => {
-            setError(null);
-            setScreen("security");
-          }}
-        />
+        >
+          <Text style={styles.link}>
+            Budget:{" "}
+            {dashBudgets.find((b) => b.id === dashBudgetId)?.name ?? "none"} (tap
+            to change)
+          </Text>
+        </Pressable>
+
+        {/* AC1: Period picker with historical navigation — index moves over the
+            already-loaded, newest-first array; no query per click. */}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+          <Pressable
+            onPress={() =>
+              setDashPeriodIndex((i) =>
+                Math.min(i + 1, dashPeriods.length - 1),
+              )
+            }
+          >
+            <Text
+              style={[
+                styles.link,
+                dashPeriodIndex >= dashPeriods.length - 1 && { opacity: 0.3 },
+              ]}
+            >
+              ← Older
+            </Text>
+          </Pressable>
+          <Text>
+            {dashPeriod
+              ? `${dashPeriod.period_start} – ${dashPeriod.period_end}`
+              : "No periods yet"}
+          </Text>
+          <Pressable
+            onPress={() => setDashPeriodIndex((i) => Math.max(i - 1, 0))}
+          >
+            <Text
+              style={[styles.link, dashPeriodIndex <= 0 && { opacity: 0.3 }]}
+            >
+              Newer →
+            </Text>
+          </Pressable>
+        </View>
+
+        {/* AC2: Category-state list — the dominant element. AC4: a Category with
+            no data shows "—" / "No limit", never an error. */}
+        <View style={{ width: "100%", gap: 6 }}>
+          {dashStates.length === 0 ? (
+            <Text>No categories to show for this period yet.</Text>
+          ) : (
+            dashStates.map((state) => {
+              const empty = state.spent === 0 && state.limit_amount === 0;
+              return (
+                <View
+                  key={state.category_id}
+                  style={{
+                    flexDirection: "row",
+                    justifyContent: "space-between",
+                    borderBottomWidth: 1,
+                    borderBottomColor: "#eee",
+                    paddingVertical: 6,
+                  }}
+                >
+                  <Text style={{ fontWeight: "600" }}>
+                    {state.category_name}
+                  </Text>
+                  <Text>
+                    {empty ? "—" : state.spent.toFixed(2)} /{" "}
+                    {state.limit_amount === 0
+                      ? "No limit"
+                      : state.limit_amount.toFixed(2)}
+                  </Text>
+                </View>
+              );
+            })
+          )}
+        </View>
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        {/* Relocated entry points — these screens have no other way in yet. */}
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, justifyContent: "center" }}>
+          <Pressable onPress={() => { setError(null); setScreen("create-budget"); }}>
+            <Text style={styles.link}>New budget</Text>
+          </Pressable>
+          <Pressable onPress={async () => { setError(null); await loadAccountBudgets(); setScreen("create-account"); }}>
+            <Text style={styles.link}>New account</Text>
+          </Pressable>
+          <Pressable onPress={async () => { setError(null); await loadTransactionData(); setScreen("create-transaction"); }}>
+            <Text style={styles.link}>Add transaction</Text>
+          </Pressable>
+          <Pressable onPress={async () => { setError(null); await loadTransactionList(); setScreen("transaction-list"); }}>
+            <Text style={styles.link}>Transactions</Text>
+          </Pressable>
+          <Pressable onPress={() => { setError(null); setInviteSent(false); setScreen("invite-send"); }}>
+            <Text style={styles.link}>Invite</Text>
+          </Pressable>
+          <Pressable onPress={() => { setError(null); setScreen("account"); }}>
+            <Text style={styles.link}>Account</Text>
+          </Pressable>
+          <Pressable onPress={() => { setError(null); setScreen("security"); }}>
+            <Text style={styles.link}>Security</Text>
+          </Pressable>
+        </View>
+
         <StatusBar style="auto" />
       </View>
     );
