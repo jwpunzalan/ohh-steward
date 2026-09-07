@@ -27,11 +27,15 @@ type Screen =
   | "accept-invite"
   | "account"
   | "security"
-  | "create-account";
+  | "create-account"
+  | "create-transaction";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
+type Direction = "expense" | "income";
 type Budget = { id: string; name: string; default_currency: string | null };
+type TxnAccount = { id: string; name: string };
+type TxnCategory = { id: string; name: string };
 
 // After any successful full authentication (signup, password-only signin,
 // or a signin's MFA challenge/verify step), persist the session for future
@@ -93,6 +97,19 @@ export default function App() {
   const [accountOpeningBalance, setAccountOpeningBalance] = useState("0");
   const [accountTargetAmount, setAccountTargetAmount] = useState("");
   const [accountCreditLimit, setAccountCreditLimit] = useState("");
+  const [txnAccounts, setTxnAccounts] = useState<TxnAccount[]>([]);
+  const [txnCategories, setTxnCategories] = useState<TxnCategory[]>([]);
+  const [txnAccountId, setTxnAccountId] = useState("");
+  const [txnDescription, setTxnDescription] = useState("");
+  const [txnAmount, setTxnAmount] = useState("");
+  // AC3: direction defaults to expense ("buying") unless the user changes it.
+  const [txnDirection, setTxnDirection] = useState<Direction>("expense");
+  const [txnDate, setTxnDate] = useState(() =>
+    new Date().toISOString().slice(0, 10),
+  );
+  const [txnTime, setTxnTime] = useState("");
+  const [txnStore, setTxnStore] = useState("");
+  const [txnCategoryId, setTxnCategoryId] = useState("");
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -391,6 +408,62 @@ export default function App() {
 
     setSubmitting(false);
     setAccountName("");
+    setScreen("dashboard");
+  }
+
+  async function loadTransactionData() {
+    // Both queries are RLS-scoped: accounts to Budgets the caller can access,
+    // categories to the caller's household. rpc_create_transaction re-checks
+    // both server-side regardless of what the client submits.
+    const { data: accountData } = await supabase
+      .from("account")
+      .select("id, name")
+      .eq("is_deleted", false);
+    if (accountData) {
+      setTxnAccounts(accountData);
+      if (accountData[0]) setTxnAccountId(accountData[0].id);
+    }
+    const { data: categoryData } = await supabase
+      .from("category")
+      .select("id, name")
+      .eq("is_deleted", false);
+    if (categoryData) setTxnCategories(categoryData);
+  }
+
+  async function handleCreateTransaction() {
+    setSubmitting(true);
+    setError(null);
+    await touchActivity();
+
+    // p_budget_id is intentionally never sent — the RPC derives it from the
+    // referenced account server-side (AC5).
+    const { error: createError } = await supabase.rpc("rpc_create_transaction", {
+      p_account_id: txnAccountId,
+      p_description: txnDescription,
+      p_amount: Number(txnAmount),
+      p_date: txnDate,
+      p_direction: txnDirection,
+      p_time: txnTime || null,
+      p_store: txnStore || null,
+      p_category_id: txnCategoryId || null,
+    });
+
+    if (createError) {
+      // Never surface raw Supabase/Postgres error text (Secure Coding
+      // obligation 10) — e.g. "not authorized for this budget" or a
+      // validation rejection.
+      setError("We couldn't save that transaction. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    setTxnDescription("");
+    setTxnAmount("");
+    setTxnDirection("expense");
+    setTxnTime("");
+    setTxnStore("");
+    setTxnCategoryId("");
     setScreen("dashboard");
   }
 
@@ -801,6 +874,105 @@ export default function App() {
     );
   }
 
+  if (screen === "create-transaction") {
+    const selectedCategory = txnCategories.find((c) => c.id === txnCategoryId);
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Add a transaction</Text>
+
+        <Pressable
+          onPress={() => {
+            const next =
+              txnAccounts[
+                (txnAccounts.findIndex((a) => a.id === txnAccountId) + 1) %
+                  txnAccounts.length
+              ];
+            if (next) setTxnAccountId(next.id);
+          }}
+        >
+          <Text style={styles.link}>
+            Account:{" "}
+            {txnAccounts.find((a) => a.id === txnAccountId)?.name ?? "none"} (tap
+            to change)
+          </Text>
+        </Pressable>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Description"
+          value={txnDescription}
+          onChangeText={setTxnDescription}
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Amount"
+          value={txnAmount}
+          onChangeText={setTxnAmount}
+          keyboardType="numeric"
+        />
+
+        <Pressable
+          onPress={() =>
+            setTxnDirection(txnDirection === "expense" ? "income" : "expense")
+          }
+        >
+          <Text style={styles.link}>
+            Direction: {txnDirection} (tap to change)
+          </Text>
+        </Pressable>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Date (YYYY-MM-DD)"
+          value={txnDate}
+          onChangeText={setTxnDate}
+          autoCapitalize="none"
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Time (optional, HH:MM)"
+          value={txnTime}
+          onChangeText={setTxnTime}
+          autoCapitalize="none"
+        />
+        <TextInput
+          style={styles.input}
+          placeholder="Store / establishment (optional)"
+          value={txnStore}
+          onChangeText={setTxnStore}
+        />
+
+        <Pressable
+          onPress={() => {
+            if (txnCategories.length === 0) return;
+            const idx = txnCategories.findIndex((c) => c.id === txnCategoryId);
+            // Cycle: Uncategorized -> cat[0] -> cat[1] -> ... -> Uncategorized.
+            const next = idx === txnCategories.length - 1 ? null : txnCategories[idx + 1];
+            setTxnCategoryId(next ? next.id : "");
+          }}
+        >
+          <Text style={styles.link}>
+            Category: {selectedCategory?.name ?? "Uncategorized"} (tap to change)
+          </Text>
+        </Pressable>
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Saving…" : "Save transaction"}
+          onPress={handleCreateTransaction}
+          disabled={submitting || !txnAccountId}
+        />
+
+        <Pressable onPress={() => setScreen("dashboard")}>
+          <Text style={styles.link}>Cancel</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
   if (screen === "create-budget") {
     return (
       <View style={styles.container}>
@@ -859,6 +1031,14 @@ export default function App() {
             setError(null);
             await loadAccountBudgets();
             setScreen("create-account");
+          }}
+        />
+        <Button
+          title="Add a transaction"
+          onPress={async () => {
+            setError(null);
+            await loadTransactionData();
+            setScreen("create-transaction");
           }}
         />
         <Button

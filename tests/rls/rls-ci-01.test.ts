@@ -520,3 +520,323 @@ describe("RLS-CI-01: category household-scoped access", () => {
     expect(secondDeleteErr).not.toBeNull();
   });
 });
+
+/**
+ * DIP-3.1 (Story 3.1) — Transaction-scoped RLS-CI-01 coverage. Per
+ * IMPLEMENTATION_CONVENTIONS item 5 and DVP.md §3 ("attempt to read/write
+ * Budget Y's ... Transactions via any join path — must fail"), this is a
+ * committed deliverable of the story, not deferred. It also closes the
+ * Transaction side of STEW-38's three system-wide gaps: unauthenticated
+ * access (e), SQL-metacharacter literal storage (f), and Account/Transaction
+ * join-path isolation (a, c). Runs with its own fixtures: one household, a
+ * Parent, and a Member who owns Budget X only — Budget Y is Parent-only.
+ */
+describe("RLS-CI-01: transaction budget-scoped access", () => {
+  const admin = adminClient();
+  const txnRunId = `${runId}-txn`;
+  const today = new Date().toISOString().slice(0, 10);
+
+  let parentAId: string;
+  let memberId: string;
+
+  let householdAId: string;
+  let budgetXId: string; // owned by Member
+  let budgetYId: string; // Parent-only; Member is not an owner
+  let accountXId: string; // belongs to Budget X
+  let accountYId: string; // belongs to Budget Y
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+  const anon: SupabaseClient = createClient(
+    SUPABASE_URL!,
+    SUPABASE_ANON_KEY!,
+    { auth: { autoRefreshToken: false, persistSession: false } },
+  );
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${txnRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${txnRunId}-member@example.com`;
+
+    const { data: parentAUser, error: parentAErr } =
+      await admin.auth.admin.createUser({
+        email: parentAEmail,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+    if (parentAErr) throw parentAErr;
+    parentAId = parentAUser.user.id;
+
+    const { data: memberUser, error: memberErr } =
+      await admin.auth.admin.createUser({
+        email: memberEmail,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+    if (memberErr) throw memberErr;
+    memberId = memberUser.user.id;
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+
+    // Parent A's household is whatever the signup trigger created; reassign
+    // the Member into it (a fresh insert would collide with
+    // uq_household_member_active_user). service_role, bypassing RLS — fixture
+    // setup, not part of what the suite asserts.
+    const { data: parentAMember, error: parentAMemberErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (parentAMemberErr) throw parentAMemberErr;
+    householdAId = parentAMember.household_id as string;
+
+    const { data: memberRows, error: memberUpdateErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId)
+      .select("id");
+    if (memberUpdateErr) throw memberUpdateErr;
+    const memberMemberId = memberRows![0].id as string;
+
+    // Budget X: owned by the Member. Budget Y: Parent-only.
+    const { data: budgetX, error: budgetXErr } = await member.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 Txn Budget X",
+        p_period_type: "monthly",
+        p_owner_member_ids: [memberMemberId],
+      },
+    );
+    if (budgetXErr) throw budgetXErr;
+    budgetXId = budgetX as string;
+
+    const { data: budgetY, error: budgetYErr } = await parentA.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 Txn Budget Y",
+        p_period_type: "monthly",
+        p_owner_member_ids: [],
+      },
+    );
+    if (budgetYErr) throw budgetYErr;
+    budgetYId = budgetY as string;
+
+    // One plain account per Budget, each created by a caller authorized for
+    // that Budget.
+    const { data: accountX, error: accountXErr } = await member.rpc(
+      "rpc_create_account",
+      {
+        p_budget_id: budgetXId,
+        p_type: "account",
+        p_name: "Budget X Checking",
+        p_currency: "USD",
+        p_opening_balance: 0,
+      },
+    );
+    if (accountXErr) throw accountXErr;
+    accountXId = accountX as string;
+
+    const { data: accountY, error: accountYErr } = await parentA.rpc(
+      "rpc_create_account",
+      {
+        p_budget_id: budgetYId,
+        p_type: "account",
+        p_name: "Budget Y Checking",
+        p_currency: "USD",
+        p_opening_balance: 0,
+      },
+    );
+    if (accountYErr) throw accountYErr;
+    accountYId = accountY as string;
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId]) {
+      if (id) {
+        await admin.auth.admin.deleteUser(id).catch(() => {});
+      }
+    }
+  });
+
+  it("(a) Member can create a transaction against their own Budget's account", async () => {
+    const { data, error } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: "Groceries",
+      p_amount: 12.5,
+      p_date: today,
+    });
+    expect(error).toBeNull();
+    expect(typeof data).toBe("string");
+
+    const { data: rows } = await admin
+      .from("transaction")
+      .select("id, direction, currency")
+      .eq("id", data as string);
+    expect(rows).toHaveLength(1);
+    // AC3: unspecified direction defaults to expense. AC / DIP-2.4 trigger:
+    // currency is inherited from the account, never client-supplied.
+    expect(rows![0].direction).toBe("expense");
+    expect(rows![0].currency).toBe("USD");
+
+    const { data: splits } = await admin
+      .from("transaction_split")
+      .select("id, category_id, amount")
+      .eq("transaction_id", data as string);
+    expect(splits).toHaveLength(1);
+    expect(splits![0].category_id).toBeNull();
+    expect(Number(splits![0].amount)).toBe(12.5);
+  });
+
+  it("(a) Member cannot create a transaction against a Budget they are not assigned to, and no row is created", async () => {
+    const { data: before } = await admin
+      .from("transaction")
+      .select("id")
+      .eq("account_id", accountYId);
+    const beforeCount = (before ?? []).length;
+
+    const { error } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountYId,
+      p_description: "Should never persist",
+      p_amount: 99,
+      p_date: today,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: after } = await admin
+      .from("transaction")
+      .select("id")
+      .eq("account_id", accountYId);
+    expect((after ?? []).length).toBe(beforeCount);
+  });
+
+  it("(b) a direct insert into transaction (bypassing the RPC) is denied by RLS even for a Budget the caller owns", async () => {
+    const { error } = await member.from("transaction").insert({
+      budget_id: budgetXId,
+      account_id: accountXId,
+      description: "Direct insert",
+      amount: 5,
+      date: today,
+      currency: "USD",
+    });
+    expect(error).not.toBeNull();
+
+    const { data: rows } = await admin
+      .from("transaction")
+      .select("id")
+      .eq("description", "Direct insert");
+    expect(rows ?? []).toHaveLength(0);
+  });
+
+  it("(b) a direct insert into transaction_split (bypassing the RPC) is denied by RLS", async () => {
+    const { data: existing } = await admin
+      .from("transaction")
+      .select("id")
+      .eq("account_id", accountXId)
+      .limit(1);
+    const anyTxnId = existing![0].id as string;
+
+    const { error } = await member.from("transaction_split").insert({
+      transaction_id: anyTxnId,
+      amount: 1,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("(c) Member's SELECT never returns another Budget's transactions", async () => {
+    // Seed one transaction on Budget Y through the sanctioned path.
+    const { error: seedErr } = await parentA.rpc("rpc_create_transaction", {
+      p_account_id: accountYId,
+      p_description: "Budget Y private",
+      p_amount: 7,
+      p_date: today,
+    });
+    if (seedErr) throw seedErr;
+
+    const { data, error } = await member
+      .from("transaction")
+      .select("id, budget_id");
+    expect(error).toBeNull();
+    expect((data ?? []).some((r) => r.budget_id === budgetYId)).toBe(false);
+
+    // ...and not via the transaction_split join path either.
+    const { data: splits, error: splitErr } = await member
+      .from("transaction_split")
+      .select("id, transaction:transaction_id (budget_id)");
+    expect(splitErr).toBeNull();
+    expect(
+      (splits ?? []).some(
+        (r) =>
+          (r as { transaction: { budget_id: string } | null }).transaction
+            ?.budget_id === budgetYId,
+      ),
+    ).toBe(false);
+  });
+
+  it("(d) a Parent's SELECT spans every Budget in their household", async () => {
+    const { data, error } = await parentA
+      .from("transaction")
+      .select("budget_id");
+    expect(error).toBeNull();
+    const budgetIds = new Set((data ?? []).map((r) => r.budget_id));
+    expect(budgetIds.has(budgetXId)).toBe(true);
+    expect(budgetIds.has(budgetYId)).toBe(true);
+  });
+
+  it("(e) an unauthenticated call to rpc_create_transaction fails outright (grant revoked)", async () => {
+    const { error } = await anon.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: "anon attempt",
+      p_amount: 1,
+      p_date: today,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("(f) a SQL metacharacter in description/store is stored and retrieved literally", async () => {
+    const payload = "' OR '1'='1";
+    const { data: txnId, error } = await member.rpc("rpc_create_transaction", {
+      p_account_id: accountXId,
+      p_description: payload,
+      p_amount: 3,
+      p_date: today,
+      p_store: payload,
+    });
+    expect(error).toBeNull();
+
+    const { data: row } = await member
+      .from("transaction")
+      .select("description, store")
+      .eq("id", txnId as string)
+      .single();
+    expect(row?.description).toBe(payload);
+    expect(row?.store).toBe(payload);
+
+    // The literal never widened the result set — exactly one row matches.
+    const { data: matches } = await member
+      .from("transaction")
+      .select("id")
+      .eq("description", payload);
+    expect(matches).toHaveLength(1);
+  });
+
+  it("(g) fn_validate_transaction_budget_scope rejects a budget/account mismatch at the DB layer, independent of the RPC", async () => {
+    // service_role bypasses RLS but BEFORE INSERT triggers still fire. Budget
+    // X's id with Budget Y's account must be rejected by the trigger even
+    // though the RPC (which already blocks this) is not involved here.
+    const { error } = await admin.from("transaction").insert({
+      budget_id: budgetXId,
+      account_id: accountYId,
+      description: "trigger-layer mismatch",
+      amount: 5,
+      date: today,
+      currency: "USD",
+    });
+    expect(error).not.toBeNull();
+
+    const { data: rows } = await admin
+      .from("transaction")
+      .select("id")
+      .eq("description", "trigger-layer mismatch");
+    expect(rows ?? []).toHaveLength(0);
+  });
+});

@@ -12,6 +12,8 @@ export default function DashboardPage() {
       <br />
       <Link href="/dashboard/accounts/new">Add an account</Link>
       <br />
+      <Link href="/dashboard/transactions/new">Add a transaction</Link>
+      <br />
       <Link href="/dashboard/invites/new">Invite someone to your household</Link>
       <br />
       <Link href="/dashboard/account">Account</Link>
