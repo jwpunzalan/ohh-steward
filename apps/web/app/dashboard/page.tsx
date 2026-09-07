@@ -15,6 +15,15 @@ type CategoryState = {
   spent: number;
 };
 type Band = "pending" | "green" | "amber" | "red";
+type AccountRow = {
+  id: string;
+  type: string;
+  name: string;
+  currency: string;
+  current_balance: number;
+  balance_owed: number | null;
+};
+type AcctTotals = Record<string, { income: number; expense: number }>;
 
 // Other dashboard destinations still have no other entry point in the app, so
 // they are relocated into a compact nav row rather than deleted (DIP item 5).
@@ -95,6 +104,10 @@ export default function DashboardPage() {
   const [periodIndex, setPeriodIndex] = useState(0);
   const [states, setStates] = useState<CategoryState[]>([]);
   const [currency, setCurrency] = useState<string | null>(null);
+  // Story 6.3: Accounts/Cards/Savings summary — one accounts query + one
+  // period-scoped transaction query for the whole Budget (no per-account loop).
+  const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [acctTotals, setAcctTotals] = useState<AcctTotals>({});
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -145,9 +158,44 @@ export default function DashboardPage() {
       .order("created_at")
       .limit(1)
       .then(({ data }) => setCurrency(data?.[0]?.currency ?? null));
+    // AC1: per-record current balance.
+    supabase
+      .from("account")
+      .select("id, type, name, currency, current_balance, balance_owed")
+      .eq("budget_id", budgetId)
+      .eq("is_deleted", false)
+      .order("created_at")
+      .then(({ data }) => setAccounts((data as AccountRow[]) ?? []));
   }, [budgetId]);
 
   const selectedPeriodId = periods[periodIndex]?.id ?? "";
+  const selectedPeriod = periods[periodIndex];
+
+  // AC1: period-scoped +/- totals — one query for the whole Budget, aggregated
+  // client-side by account_id/direction (no fan-out, no per-account query).
+  useEffect(() => {
+    if (!budgetId || !selectedPeriod) {
+      setAcctTotals({});
+      return;
+    }
+    const supabase = createClient();
+    supabase
+      .from("transaction")
+      .select("account_id, direction, amount")
+      .eq("budget_id", budgetId)
+      .eq("is_deleted", false)
+      .gte("date", selectedPeriod.period_start)
+      .lte("date", selectedPeriod.period_end)
+      .then(({ data }) => {
+        const totals: AcctTotals = {};
+        for (const row of data ?? []) {
+          const t = (totals[row.account_id] ??= { income: 0, expense: 0 });
+          if (row.direction === "income") t.income += Number(row.amount);
+          else t.expense += Number(row.amount);
+        }
+        setAcctTotals(totals);
+      });
+  }, [budgetId, selectedPeriod?.period_start, selectedPeriod?.period_end]);
 
   const loadStates = useCallback(async () => {
     if (!selectedPeriodId) {
@@ -268,7 +316,57 @@ export default function DashboardPage() {
         </p>
       )}
 
-      <section style={{ marginTop: "1rem" }}>
+      <section style={{ marginTop: "1.5rem" }}>
+        <h2 style={{ fontSize: "1rem" }}>Accounts</h2>
+        {accounts.length === 0 ? (
+          <p>No accounts in this budget yet.</p>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ textAlign: "left", borderBottom: "1px solid #ccc" }}>
+                <th style={{ padding: "0.5rem 0.25rem" }}>Account</th>
+                <th style={{ padding: "0.5rem 0.25rem", textAlign: "right" }}>Balance</th>
+                <th style={{ padding: "0.5rem 0.25rem", textAlign: "right" }}>+ / − this period</th>
+              </tr>
+            </thead>
+            <tbody>
+              {accounts.map((account) => {
+                const t = acctTotals[account.id] ?? { income: 0, expense: 0 };
+                const balance =
+                  account.type === "credit_card"
+                    ? (account.balance_owed ?? 0)
+                    : account.current_balance;
+                return (
+                  <tr
+                    key={account.id}
+                    style={{ borderBottom: "1px solid #eee" }}
+                  >
+                    <td style={{ padding: "0.5rem 0.25rem" }}>
+                      <Link href={`/dashboard/accounts/${account.id}`}>
+                        {account.name}
+                      </Link>{" "}
+                      <span style={{ color: "#666", fontSize: "0.8rem" }}>
+                        {account.type === "credit_card"
+                          ? "card · owed"
+                          : account.type}
+                      </span>
+                    </td>
+                    <td style={{ padding: "0.5rem 0.25rem", textAlign: "right" }}>
+                      {balance.toFixed(2)} {account.currency}
+                    </td>
+                    <td style={{ padding: "0.5rem 0.25rem", textAlign: "right" }}>
+                      <span style={{ color: "#1a7f37" }}>+{t.income.toFixed(2)}</span>{" "}
+                      <span style={{ color: "#cf222e" }}>−{t.expense.toFixed(2)}</span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section style={{ marginTop: "1.5rem" }}>
         <h2 style={{ fontSize: "1rem" }}>Categories this period</h2>
         {states.length === 0 ? (
           <p>No categories to show for this period yet.</p>

@@ -2273,3 +2273,173 @@ describe("RLS-CI-01: v_category_period_state (dashboard)", () => {
     expect(Number(data?.spent)).toBe(30); // income excluded; only the expense split
   });
 });
+
+/**
+ * DIP-6.3 (Story 6.3) — rpc_update_account. Covers the negative security AC
+ * (a caller without budget access is rejected before any write) plus the
+ * structural guarantee that this RPC cannot change an account's type,
+ * currency, budget, or balances (it has no parameters for them) and mirrors
+ * rpc_create_account's type-specific field validation.
+ */
+describe("RLS-CI-01: account edit via rpc_update_account", () => {
+  const admin = adminClient();
+  const acctRunId = `${runId}-acctedit`;
+
+  let parentAId: string;
+  let memberId: string;
+  let householdAId: string;
+  let budgetXId: string; // Member-owned
+  let budgetYId: string; // Parent-only
+  let accountXId: string; // plain account in Budget X (Member can edit)
+  let accountYId: string; // account in Budget Y (Member cannot edit)
+
+  let parentA: SupabaseClient;
+  let member: SupabaseClient;
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${acctRunId}-parent-a@example.com`;
+    const memberEmail = `rls-ci-01-${acctRunId}-member@example.com`;
+
+    for (const [email, assign] of [
+      [parentAEmail, (id: string) => (parentAId = id)],
+      [memberEmail, (id: string) => (memberId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parentA = await signInClient(parentAEmail);
+    member = await signInClient(memberEmail);
+
+    const { data: parentAMember } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    householdAId = parentAMember!.household_id as string;
+
+    const { data: memberRows } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberId)
+      .select("id");
+    const memberMemberId = memberRows![0].id as string;
+
+    const { data: bx } = await member.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Acct Budget X",
+      p_period_type: "monthly",
+      p_owner_member_ids: [memberMemberId],
+    });
+    budgetXId = bx as string;
+    const { data: by } = await parentA.rpc("rpc_create_budget", {
+      p_name: "RLS-CI-01 Acct Budget Y",
+      p_period_type: "monthly",
+      p_owner_member_ids: [],
+    });
+    budgetYId = by as string;
+
+    const { data: ax } = await member.rpc("rpc_create_account", {
+      p_budget_id: budgetXId,
+      p_type: "account",
+      p_name: "X Checking",
+      p_currency: "USD",
+      p_opening_balance: 0,
+    });
+    accountXId = ax as string;
+    const { data: ay } = await parentA.rpc("rpc_create_account", {
+      p_budget_id: budgetYId,
+      p_type: "account",
+      p_name: "Y Checking",
+      p_currency: "USD",
+      p_opening_balance: 0,
+    });
+    accountYId = ay as string;
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("an owner can rename their own account; type/currency/budget/balance are untouched", async () => {
+    const { data: before } = await admin
+      .from("account")
+      .select("type, currency, budget_id, current_balance")
+      .eq("id", accountXId)
+      .single();
+
+    const { error } = await member.rpc("rpc_update_account", {
+      p_account_id: accountXId,
+      p_name: "X Checking (renamed)",
+    });
+    expect(error).toBeNull();
+
+    const { data: after } = await admin
+      .from("account")
+      .select("name, type, currency, budget_id, current_balance")
+      .eq("id", accountXId)
+      .single();
+    expect(after?.name).toBe("X Checking (renamed)");
+    expect(after?.type).toBe(before?.type);
+    expect(after?.currency).toBe(before?.currency);
+    expect(after?.budget_id).toBe(before?.budget_id);
+    expect(Number(after?.current_balance)).toBe(Number(before?.current_balance));
+  });
+
+  it("negative security: a Member cannot rpc_update_account an account in a Budget they cannot access, and no row changes", async () => {
+    const { error } = await member.rpc("rpc_update_account", {
+      p_account_id: accountYId,
+      p_name: "hijacked",
+    });
+    expect(error).not.toBeNull();
+
+    const { data: row } = await admin
+      .from("account")
+      .select("name")
+      .eq("id", accountYId)
+      .single();
+    expect(row?.name).toBe("Y Checking");
+  });
+
+  it("mirrors rpc_create_account's type-specific rules: a target_amount on a plain account is rejected", async () => {
+    const { error } = await member.rpc("rpc_update_account", {
+      p_account_id: accountXId,
+      p_name: "X Checking (renamed)",
+      p_target_amount: 500,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("an empty name is rejected", async () => {
+    const { error } = await member.rpc("rpc_update_account", {
+      p_account_id: accountXId,
+      p_name: "   ",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("an unauthenticated call to rpc_update_account fails outright (grant revoked)", async () => {
+    const anon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    const { error } = await anon.rpc("rpc_update_account", {
+      p_account_id: accountXId,
+      p_name: "anon rename",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("a bogus account id is rejected (indistinguishable from unauthorized)", async () => {
+    const { error } = await member.rpc("rpc_update_account", {
+      p_account_id: "00000000-0000-0000-0000-000000000000",
+      p_name: "ghost",
+    });
+    expect(error).not.toBeNull();
+  });
+});

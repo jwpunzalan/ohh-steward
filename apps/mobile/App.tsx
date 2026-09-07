@@ -30,7 +30,8 @@ type Screen =
   | "security"
   | "create-account"
   | "create-transaction"
-  | "transaction-list";
+  | "transaction-list"
+  | "account-detail";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
@@ -58,6 +59,36 @@ type TxnListItem = {
   transaction_split: { id: string; category_id: string | null; amount: number }[];
 };
 type Band = "pending" | "green" | "amber" | "red";
+type DashAccount = {
+  id: string;
+  type: string;
+  name: string;
+  currency: string;
+  current_balance: number;
+  balance_owed: number | null;
+};
+type DetailAccount = {
+  id: string;
+  budget_id: string;
+  type: AccountType;
+  name: string;
+  currency: string;
+  current_balance: number;
+  balance_owed: number | null;
+  target_amount: number | null;
+  target_date: string | null;
+  credit_limit: number | null;
+  due_date: string | null;
+  minimum_payment: number | null;
+};
+type DetailTxn = {
+  id: string;
+  description: string;
+  amount: number;
+  direction: string;
+  date: string;
+  store: string | null;
+};
 
 const DAY_MS = 86_400_000;
 
@@ -191,6 +222,19 @@ export default function App() {
   // Story 6.2: the Budget's currency label, derived server-side from its own
   // Accounts (AC4/AC6) — single-currency per Story 2.4.G2.
   const [dashCurrency, setDashCurrency] = useState<string | null>(null);
+  // Story 6.3: Accounts/Cards/Savings summary + per-account detail view.
+  const [dashAccounts, setDashAccounts] = useState<DashAccount[]>([]);
+  const [dashAcctTotals, setDashAcctTotals] = useState<
+    Record<string, { income: number; expense: number }>
+  >({});
+  const [detailAccount, setDetailAccount] = useState<DetailAccount | null>(null);
+  const [detailTxns, setDetailTxns] = useState<DetailTxn[]>([]);
+  const [editName, setEditName] = useState("");
+  const [editTargetAmount, setEditTargetAmount] = useState("");
+  const [editTargetDate, setEditTargetDate] = useState("");
+  const [editCreditLimit, setEditCreditLimit] = useState("");
+  const [editDueDate, setEditDueDate] = useState("");
+  const [editMinPayment, setEditMinPayment] = useState("");
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -245,6 +289,14 @@ export default function App() {
     loadCategoryStates(dashPeriods[dashPeriodIndex]?.id ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dashPeriods, dashPeriodIndex]);
+
+  // Story 6.3: accounts summary + period-scoped totals for the selected Budget.
+  useEffect(() => {
+    if (dashBudgetId) {
+      loadAccountSummaries(dashBudgetId, dashPeriods[dashPeriodIndex]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dashBudgetId, dashPeriods, dashPeriodIndex]);
 
   async function handleSubmit() {
     setSubmitting(true);
@@ -559,6 +611,113 @@ export default function App() {
     }
     setError(null);
     setDashStates((data as CategoryState[]) ?? []);
+  }
+
+  // Story 6.3 AC1: one accounts query + one period-scoped transaction query
+  // for the whole Budget (no per-account loop). Pure reads — no
+  // guardIdleOrSignOut (same convention as loadDashboard* / loadCategoryStates).
+  async function loadAccountSummaries(budgetId: string, period?: DashPeriod) {
+    const { data: acctData } = await supabase
+      .from("account")
+      .select("id, type, name, currency, current_balance, balance_owed")
+      .eq("budget_id", budgetId)
+      .eq("is_deleted", false)
+      .order("created_at");
+    setDashAccounts((acctData as DashAccount[]) ?? []);
+
+    if (!period) {
+      setDashAcctTotals({});
+      return;
+    }
+    const { data: txnData } = await supabase
+      .from("transaction")
+      .select("account_id, direction, amount")
+      .eq("budget_id", budgetId)
+      .eq("is_deleted", false)
+      .gte("date", period.period_start)
+      .lte("date", period.period_end);
+    const totals: Record<string, { income: number; expense: number }> = {};
+    for (const row of txnData ?? []) {
+      const t = (totals[row.account_id] ??= { income: 0, expense: 0 });
+      if (row.direction === "income") t.income += Number(row.amount);
+      else t.expense += Number(row.amount);
+    }
+    setDashAcctTotals(totals);
+  }
+
+  async function loadAccountDetail(accountId: string) {
+    const { data: acct, error: acctErr } = await supabase
+      .from("account")
+      .select(
+        "id, budget_id, type, name, currency, current_balance, balance_owed, target_amount, target_date, credit_limit, due_date, minimum_payment",
+      )
+      .eq("id", accountId)
+      .eq("is_deleted", false)
+      .single();
+    if (acctErr || !acct) {
+      setError("We couldn't load that account.");
+      return;
+    }
+    const a = acct as DetailAccount;
+    setDetailAccount(a);
+    setEditName(a.name);
+    setEditTargetAmount(a.target_amount != null ? String(a.target_amount) : "");
+    setEditTargetDate(a.target_date ?? "");
+    setEditCreditLimit(a.credit_limit != null ? String(a.credit_limit) : "");
+    setEditDueDate(a.due_date ?? "");
+    setEditMinPayment(
+      a.minimum_payment != null ? String(a.minimum_payment) : "",
+    );
+
+    const { data: history } = await supabase
+      .from("transaction")
+      .select("id, description, amount, direction, date, store")
+      .eq("account_id", accountId)
+      .eq("is_deleted", false)
+      .order("date", { ascending: false })
+      .limit(25);
+    setDetailTxns((history as DetailTxn[]) ?? []);
+  }
+
+  async function handleUpdateAccount() {
+    if (!detailAccount) return;
+    setSubmitting(true);
+    setError(null);
+    // STEW-37: enforce the idle timeout before any network call (write path).
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
+
+    const isGoal = detailAccount.type === "savings_goal";
+    const isCard = detailAccount.type === "credit_card";
+    // rpc_update_account never accepts type/currency/budget_id/balance fields;
+    // type-inappropriate fields go as null and the RPC re-validates server-side.
+    const { error: rpcError } = await supabase.rpc("rpc_update_account", {
+      p_account_id: detailAccount.id,
+      p_name: editName,
+      p_target_amount:
+        isGoal && editTargetAmount ? Number(editTargetAmount) : null,
+      p_target_date: isGoal && editTargetDate ? editTargetDate : null,
+      p_credit_limit:
+        isCard && editCreditLimit ? Number(editCreditLimit) : null,
+      p_due_date: isCard && editDueDate ? editDueDate : null,
+      p_minimum_payment:
+        isCard && editMinPayment ? Number(editMinPayment) : null,
+    });
+
+    if (rpcError) {
+      // Generic message only (obligation 10) — "account not found" and "not
+      // authorized" are intentionally indistinguishable to the caller.
+      setError("We couldn't save those changes. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    await loadAccountDetail(detailAccount.id);
   }
 
   async function handleCreateAccount() {
@@ -1639,6 +1798,44 @@ export default function App() {
           </View>
         )}
 
+        {/* Story 6.3 AC1: Accounts/Cards/Savings summary — current balance plus
+            period-scoped +/- totals per record. Tap a row to open its detail. */}
+        {dashAccounts.length > 0 && (
+          <View style={{ width: "100%", gap: 4 }}>
+            <Text style={{ fontWeight: "600" }}>Accounts</Text>
+            {dashAccounts.map((acct) => {
+              const t = dashAcctTotals[acct.id] ?? { income: 0, expense: 0 };
+              const balance =
+                acct.type === "credit_card"
+                  ? (acct.balance_owed ?? 0)
+                  : acct.current_balance;
+              return (
+                <Pressable
+                  key={acct.id}
+                  onPress={() => {
+                    setError(null);
+                    loadAccountDetail(acct.id);
+                    setScreen("account-detail");
+                  }}
+                  style={{
+                    borderBottomWidth: 1,
+                    borderBottomColor: "#eee",
+                    paddingVertical: 6,
+                  }}
+                >
+                  <Text style={styles.link}>
+                    {acct.name} ({acct.type === "credit_card" ? "card · owed" : acct.type})
+                  </Text>
+                  <Text>
+                    {balance.toFixed(2)} {acct.currency} · +{t.income.toFixed(2)} / −
+                    {t.expense.toFixed(2)}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        )}
+
         {/* AC2: Category-state list — the dominant element. AC4: a Category with
             no data shows "—" / "No limit", never an error. */}
         <View style={{ width: "100%", gap: 6 }}>
@@ -1711,6 +1908,127 @@ export default function App() {
             <Text style={styles.link}>Security</Text>
           </Pressable>
         </View>
+
+        <StatusBar style="auto" />
+      </View>
+    );
+  }
+
+  if (screen === "account-detail") {
+    const a = detailAccount;
+    const balance = a
+      ? a.type === "credit_card"
+        ? (a.balance_owed ?? 0)
+        : a.current_balance
+      : 0;
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>{a ? a.name : "Account"}</Text>
+
+        {a && (
+          <Text style={{ color: "#666" }}>
+            {a.type} · {balance.toFixed(2)} {a.currency}
+            {a.type === "credit_card" ? " owed" : ""}
+          </Text>
+        )}
+
+        {/* AC2: edit name and the type-specific fields — never type/currency/
+            budget/balance (rpc_update_account has no parameters for those). */}
+        <TextInput
+          style={styles.input}
+          placeholder="Name"
+          value={editName}
+          onChangeText={setEditName}
+        />
+
+        {a?.type === "savings_goal" && (
+          <>
+            <TextInput
+              style={styles.input}
+              placeholder="Target amount"
+              value={editTargetAmount}
+              onChangeText={setEditTargetAmount}
+              keyboardType="numeric"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Target date (YYYY-MM-DD, optional)"
+              value={editTargetDate}
+              onChangeText={setEditTargetDate}
+              autoCapitalize="none"
+            />
+          </>
+        )}
+
+        {a?.type === "credit_card" && (
+          <>
+            <TextInput
+              style={styles.input}
+              placeholder="Credit limit"
+              value={editCreditLimit}
+              onChangeText={setEditCreditLimit}
+              keyboardType="numeric"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Due date (YYYY-MM-DD, optional)"
+              value={editDueDate}
+              onChangeText={setEditDueDate}
+              autoCapitalize="none"
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Minimum payment (optional)"
+              value={editMinPayment}
+              onChangeText={setEditMinPayment}
+              keyboardType="numeric"
+            />
+          </>
+        )}
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Saving…" : "Save changes"}
+          onPress={handleUpdateAccount}
+          disabled={submitting || !a}
+        />
+
+        <Text style={{ fontWeight: "600", marginTop: 8 }}>Recent transactions</Text>
+        {detailTxns.length === 0 ? (
+          <Text>No transactions for this account yet.</Text>
+        ) : (
+          detailTxns.map((txn) => (
+            <View
+              key={txn.id}
+              style={{
+                width: "100%",
+                borderBottomWidth: 1,
+                borderBottomColor: "#eee",
+                paddingVertical: 6,
+              }}
+            >
+              <Text>
+                {txn.description} — {txn.direction === "income" ? "+" : "−"}
+                {txn.amount.toFixed(2)} {a?.currency ?? ""}
+              </Text>
+              <Text style={{ color: "#666", fontSize: 12 }}>
+                {txn.date}
+                {txn.store ? ` · ${txn.store}` : ""}
+              </Text>
+            </View>
+          ))
+        )}
+
+        <Pressable
+          onPress={() => {
+            setError(null);
+            setDetailAccount(null);
+            setScreen("dashboard");
+          }}
+        >
+          <Text style={styles.link}>Back to dashboard</Text>
+        </Pressable>
 
         <StatusBar style="auto" />
       </View>
