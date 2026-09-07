@@ -57,6 +57,46 @@ type TxnListItem = {
   direction: string;
   transaction_split: { id: string; category_id: string | null; amount: number }[];
 };
+type Band = "pending" | "green" | "amber" | "red";
+
+const DAY_MS = 86_400_000;
+
+// Story 6.2 — pacing ratio = (% of budget spent) / (% of period elapsed).
+// Elapsed time is clamped to [period_start, period_end], so an already-closed
+// period reads as exactly 100% elapsed (ratio = spent/limit) and a not-yet-
+// started one reads as 0% -> null -> 'pending' (AC5). Mirrors the DIP's SQL
+// formula, day-based (budget_period columns are `date`; date-date is an
+// integer number of days).
+function pacingRatio(
+  spent: number,
+  limit: number,
+  periodStart: string,
+  periodEnd: string,
+): number | null {
+  if (limit <= 0) return null;
+  const start = Date.parse(periodStart);
+  const end = Date.parse(periodEnd);
+  const today = Date.parse(new Date().toISOString().slice(0, 10));
+  const elapsedDays = (Math.max(Math.min(today, end), start) - start) / DAY_MS;
+  const totalDays = (end - start) / DAY_MS;
+  if (elapsedDays <= 0 || totalDays <= 0) return null;
+  return spent / limit / (elapsedDays / totalDays);
+}
+
+// Fixed thresholds (AC1/AC2), identical to fn_pacing_band().
+function pacingBand(ratio: number | null): Band {
+  if (ratio === null) return "pending";
+  if (ratio <= 1.1) return "green";
+  if (ratio <= 1.3) return "amber";
+  return "red";
+}
+
+const BAND_COLOR: Record<Band, string> = {
+  pending: "#6b7280", // neutral grey — never a "colour" signal (AC5)
+  green: "#1a7f37",
+  amber: "#9a6700",
+  red: "#cf222e",
+};
 
 // After any successful full authentication (signup, password-only signin,
 // or a signin's MFA challenge/verify step), persist the session for future
@@ -148,6 +188,9 @@ export default function App() {
   const [dashPeriods, setDashPeriods] = useState<DashPeriod[]>([]);
   const [dashPeriodIndex, setDashPeriodIndex] = useState(0);
   const [dashStates, setDashStates] = useState<CategoryState[]>([]);
+  // Story 6.2: the Budget's currency label, derived server-side from its own
+  // Accounts (AC4/AC6) — single-currency per Story 2.4.G2.
+  const [dashCurrency, setDashCurrency] = useState<string | null>(null);
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -476,6 +519,7 @@ export default function App() {
 
   async function loadDashboardPeriods(budgetId: string) {
     setDashPeriodIndex(0);
+    setDashCurrency(null);
     const { data, error: periodError } = await supabase
       .from("budget_period")
       .select("id, period_start, period_end")
@@ -486,6 +530,17 @@ export default function App() {
       return;
     }
     setDashPeriods(data ?? []);
+
+    // Story 6.2 AC4/AC6: currency label derived server-side from the Budget's
+    // own (single-currency, per 2.4.G2) Accounts — never client-supplied.
+    const { data: acct } = await supabase
+      .from("account")
+      .select("currency")
+      .eq("budget_id", budgetId)
+      .eq("is_deleted", false)
+      .order("created_at")
+      .limit(1);
+    setDashCurrency(acct?.[0]?.currency ?? null);
   }
 
   async function loadCategoryStates(periodId: string) {
@@ -1478,6 +1533,45 @@ export default function App() {
 
   if (screen === "dashboard") {
     const dashPeriod = dashPeriods[dashPeriodIndex];
+    const money = (n: number) =>
+      dashCurrency ? `${n.toFixed(2)} ${dashCurrency}` : n.toFixed(2);
+    const bandBadge = (band: Band) => (
+      <Text
+        style={{
+          color: "#fff",
+          backgroundColor: BAND_COLOR[band],
+          borderRadius: 999,
+          paddingHorizontal: 8,
+          paddingVertical: 1,
+          fontSize: 12,
+          overflow: "hidden",
+          textTransform: "capitalize",
+        }}
+      >
+        {band}
+      </Text>
+    );
+    // AC3/AC6: Budget-level pacing — sum the already-fetched single-currency
+    // Category rows through one grouping key; no per-account fan-out, no blend.
+    const dashSummary =
+      dashPeriod && dashStates.length > 0
+        ? (() => {
+            const totalSpent = dashStates.reduce((s, r) => s + r.spent, 0);
+            const totalLimit = dashStates.reduce((s, r) => s + r.limit_amount, 0);
+            return {
+              totalSpent,
+              totalLimit,
+              band: pacingBand(
+                pacingRatio(
+                  totalSpent,
+                  totalLimit,
+                  dashPeriod.period_start,
+                  dashPeriod.period_end,
+                ),
+              ),
+            };
+          })()
+        : null;
     return (
       <View style={styles.container}>
         <Text style={styles.title}>Dashboard</Text>
@@ -1534,6 +1628,17 @@ export default function App() {
           </Pressable>
         </View>
 
+        {/* Story 6.2: Budget-level pacing summary (AC3), currency-labelled (AC4). */}
+        {dashSummary && (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+            <Text style={{ fontWeight: "600" }}>This period:</Text>
+            <Text>
+              {money(dashSummary.totalSpent)} of {money(dashSummary.totalLimit)}
+            </Text>
+            {bandBadge(dashSummary.band)}
+          </View>
+        )}
+
         {/* AC2: Category-state list — the dominant element. AC4: a Category with
             no data shows "—" / "No limit", never an error. */}
         <View style={{ width: "100%", gap: 6 }}>
@@ -1542,12 +1647,23 @@ export default function App() {
           ) : (
             dashStates.map((state) => {
               const empty = state.spent === 0 && state.limit_amount === 0;
+              const band = dashPeriod
+                ? pacingBand(
+                    pacingRatio(
+                      state.spent,
+                      state.limit_amount,
+                      dashPeriod.period_start,
+                      dashPeriod.period_end,
+                    ),
+                  )
+                : "pending";
               return (
                 <View
                   key={state.category_id}
                   style={{
                     flexDirection: "row",
                     justifyContent: "space-between",
+                    alignItems: "center",
                     borderBottomWidth: 1,
                     borderBottomColor: "#eee",
                     paddingVertical: 6,
@@ -1556,12 +1672,13 @@ export default function App() {
                   <Text style={{ fontWeight: "600" }}>
                     {state.category_name}
                   </Text>
-                  <Text>
-                    {empty ? "—" : state.spent.toFixed(2)} /{" "}
-                    {state.limit_amount === 0
-                      ? "No limit"
-                      : state.limit_amount.toFixed(2)}
-                  </Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <Text>
+                      {empty ? "—" : money(state.spent)} /{" "}
+                      {state.limit_amount === 0 ? "No limit" : money(state.limit_amount)}
+                    </Text>
+                    {bandBadge(band)}
+                  </View>
                 </View>
               );
             })
