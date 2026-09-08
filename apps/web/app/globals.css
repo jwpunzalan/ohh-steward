@@ -3,6 +3,44 @@
   --foreground: #171717;
 }
 
+/*
+ * Story 10.1 — Design System Foundation.
+ * "Warm & friendly", blue-primary. Values verbatim from Joseph's approved
+ * mockup (2026-09-08). --color-green / --color-amber / --color-red are
+ * RESERVED for pacing-band semantics (Story 6.2) — never decorative/category.
+ */
+:root {
+  --color-bg: #fbf3e7;
+  --color-card: #fffdf9;
+  --color-text: #3a2e22;
+  --color-text-muted: #8b7a67;
+  --color-border: #efe2ce;
+
+  --color-primary: #3d7bd9;
+  --color-primary-dark: #2c64b8;
+  --color-primary-tint: #dde9fb;
+
+  --color-coral: #f2795c;
+  --color-gold: #f0b429;
+  --color-lavender: #9b87f5;
+  --color-slate: #5b6b8c;
+  --color-slate-tint: #e7eaf2;
+  --color-sage: #6fa287;
+
+  --color-green: #4caf7d;
+  --color-amber: #f2b84b;
+  --color-red: #e8735a;
+
+  --radius-card: 20px;
+  --radius-input: 14px;
+  --radius-pill: 999px;
+
+  --shadow-card: 0 8px 24px rgba(58, 46, 34, 0.08);
+
+  --font-heading: var(--font-nunito), system-ui, sans-serif;
+  --font-body: var(--font-work-sans), system-ui, sans-serif;
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     --background: #0a0a0a;
@@ -26,7 +64,7 @@ body {
   flex-direction: column;
   color: var(--foreground);
   background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-work-sans), system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

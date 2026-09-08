@@ -2,6 +2,17 @@ import { useEffect, useState } from "react";
 import { AppState } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { Button, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { useFonts } from "expo-font";
+import {
+  Nunito_700Bold,
+  Nunito_800ExtraBold,
+} from "@expo-google-fonts/nunito";
+import {
+  WorkSans_400Regular,
+  WorkSans_500Medium,
+  WorkSans_600SemiBold,
+} from "@expo-google-fonts/work-sans";
+import { colors as themeColors } from "./theme";
 import { supabase } from "./lib/supabase";
 import {
   cacheSessionTimeoutMinutes,
@@ -158,6 +169,18 @@ async function completeAuthentication(session: Session): Promise<void> {
 }
 
 export default function App() {
+  // Story 10.1: load the design-system typefaces before rendering. Sub-second
+  // asset load on app start; render a bare warm-cream View until it resolves
+  // (avoids a flash of unstyled text). This is the ONLY change 10.1 makes to
+  // this file — every screen below renders exactly as it does today.
+  const [fontsLoaded] = useFonts({
+    Nunito_700Bold,
+    Nunito_800ExtraBold,
+    WorkSans_400Regular,
+    WorkSans_500Medium,
+    WorkSans_600SemiBold,
+  });
+
   const [screen, setScreen] = useState<Screen>("loading");
   const [mode, setMode] = useState<Mode>("signup");
   const [email, setEmail] = useState("");
@@ -997,6 +1020,12 @@ export default function App() {
     setSubmitting(false);
     await supabase.auth.signOut();
     setScreen("auth");
+  }
+
+  // Story 10.1: hold rendering on a bare warm-cream background until the
+  // design-system fonts have loaded. (All hooks above run unconditionally.)
+  if (!fontsLoaded) {
+    return <View style={{ flex: 1, backgroundColor: themeColors.bg }} />;
   }
 
   if (screen === "check-email") {
