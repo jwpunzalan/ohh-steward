@@ -27,7 +27,7 @@ const workSans = Work_Sans({
 });
 
 export const metadata: Metadata = {
-  title: "OHh Steward",
+  title: "Steward",
   description: "Household budgeting that keeps families on the same page.",
 };
 
