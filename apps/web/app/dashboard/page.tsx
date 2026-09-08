@@ -13,7 +13,6 @@ import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
-import { Chip } from "@/components/ui/Chip";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { IconBadge } from "@/components/ui/IconBadge";
 
@@ -38,18 +37,6 @@ type AccountRow = {
   target_amount: number | null;
 };
 type AcctTotals = Record<string, { income: number; expense: number }>;
-
-// Every destination stays reachable (AC4) — restyled as design-system pills,
-// not removed. Each keeps its exact existing href.
-const NAV_LINKS: { href: string; label: string }[] = [
-  { href: "/dashboard/budgets/new", label: "New budget" },
-  { href: "/dashboard/accounts/new", label: "New account" },
-  { href: "/dashboard/transactions/new", label: "Add transaction" },
-  { href: "/dashboard/transactions", label: "Transactions" },
-  { href: "/dashboard/invites/new", label: "Invite" },
-  { href: "/dashboard/account", label: "Account" },
-  { href: "/dashboard/security", label: "Security" },
-];
 
 const DAY_MS = 86_400_000;
 
@@ -539,14 +526,6 @@ export default function DashboardPage() {
           </Button>
         </div>
       </div>
-
-      <nav style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
-        {NAV_LINKS.map((link) => (
-          <Chip key={link.href} onClick={() => router.push(link.href)}>
-            {link.label}
-          </Chip>
-        ))}
-      </nav>
 
       {error && (
         <p role="alert" style={{ color: "var(--color-red)", margin: 0 }}>
