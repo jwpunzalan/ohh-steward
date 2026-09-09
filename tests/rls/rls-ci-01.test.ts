@@ -2445,15 +2445,15 @@ describe("RLS-CI-01: account edit via rpc_update_account", () => {
 });
 
 /**
- * DIP-7.1 (Story 7.1) — household cap admin. Per IMPLEMENTATION_CONVENTIONS
- * item 5: `household`'s own RLS policy and its first-ever RPC have zero
- * existing test coverage. Covers rpc_update_household_caps' Parent-only
- * server-side check (AC4), out-of-range rejection, the new CHECK constraint as
- * the backstop for any write path, unauthenticated denial (assert outcome,
- * not shape — item 7), and the household_parent_access RLS policy denying a
- * Member's direct write (never exercised before).
+ * DIP-7.1.G1 (Story 7.1.G1) — Story 7.1's rpc_update_household_caps was removed
+ * (member_cap/budget_cap are a platform-owner setting, not Parent-facing), so
+ * the four RPC-exercising tests are gone. These two remain: they're still the
+ * only coverage of `household`'s own RLS/CHECK behavior (IMPLEMENTATION_CONVENTIONS
+ * item 5) — the CHECK constraint as the backstop for a direct out-of-range
+ * write, and the household_parent_access RLS policy filtering a Member's direct
+ * write. Both are unaffected by dropping the RPC.
  */
-describe("RLS-CI-01: household cap admin access", () => {
+describe("RLS-CI-01: household direct-write constraints", () => {
   const admin = adminClient();
   const capRunId = `${runId}-caps`;
 
@@ -2512,53 +2512,6 @@ describe("RLS-CI-01: household cap admin access", () => {
     for (const id of [parentAId, memberBId]) {
       if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
     }
-  });
-
-  it("AC1/AC3: a Parent can set caps via rpc_update_household_caps and a subsequent read reflects it", async () => {
-    const { error } = await parentA.rpc("rpc_update_household_caps", {
-      p_member_cap: 7,
-      p_budget_cap: 4,
-    });
-    expect(error).toBeNull();
-    expect(await caps()).toEqual({ member: 7, budget: 4 });
-  });
-
-  it("AC4: a Member calling rpc_update_household_caps is denied and the caps are unchanged", async () => {
-    const before = await caps();
-    const { error } = await memberB.rpc("rpc_update_household_caps", {
-      p_member_cap: 42,
-      p_budget_cap: 42,
-    });
-    expect(error).not.toBeNull();
-    expect(await caps()).toEqual(before);
-  });
-
-  it("an unauthenticated call to rpc_update_household_caps is denied", async () => {
-    const anon = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    });
-    const before = await caps();
-    const { error } = await anon.rpc("rpc_update_household_caps", {
-      p_member_cap: 3,
-      p_budget_cap: 3,
-    });
-    expect(error).not.toBeNull();
-    expect(await caps()).toEqual(before);
-  });
-
-  it("rpc_update_household_caps rejects an out-of-range value and leaves the row unchanged", async () => {
-    const before = await caps();
-    const low = await parentA.rpc("rpc_update_household_caps", {
-      p_member_cap: 0,
-      p_budget_cap: 4,
-    });
-    expect(low.error).not.toBeNull();
-    const high = await parentA.rpc("rpc_update_household_caps", {
-      p_member_cap: 5,
-      p_budget_cap: 51,
-    });
-    expect(high.error).not.toBeNull();
-    expect(await caps()).toEqual(before);
   });
 
   it("a direct .from('household').update() with an out-of-range cap is rejected by the CHECK constraint", async () => {
