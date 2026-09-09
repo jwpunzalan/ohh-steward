@@ -2705,3 +2705,124 @@ describe("RLS-CI-01: budget settings surplus-destination validation (7.1.G2)", (
     expect(await surplusOf()).toBe(savingsSameBudgetId);
   });
 });
+
+/**
+ * DIP-7.2 (Story 7.2) — first client-facing read surface over audit_log_entry
+ * (the Audit Log viewer), so per IMPLEMENTATION_CONVENTIONS item 5 this closes
+ * the zero-coverage gap on its RLS policy. audit_log_read is Parent-only
+ * (qual joins through household_member_id to is_household_parent) — a different
+ * isolation shape than every other RLS-CI-01 block, which use
+ * can_access_budget. Covers: a Parent reads their own household's entries; a
+ * non-Parent Member of the same household is denied; a Parent of a different
+ * household cannot read them (cross-household); an anon client is denied
+ * (outcome asserted, not mechanism — item 7).
+ */
+describe("RLS-CI-01: audit log read access", () => {
+  const admin = adminClient();
+  const alRunId = `${runId}-audit-log`;
+
+  let parentAId: string;
+  let memberXId: string;
+  let parentBId: string;
+
+  let householdAId: string;
+  let categoryId: string; // created in setup → generates a category audit row
+
+  let parentA: SupabaseClient;
+  let memberX: SupabaseClient;
+  let parentB: SupabaseClient;
+  const anon: SupabaseClient = createClient(SUPABASE_URL!, SUPABASE_ANON_KEY!, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+
+  beforeAll(async () => {
+    const parentAEmail = `rls-ci-01-${alRunId}-parent-a@example.com`;
+    const memberXEmail = `rls-ci-01-${alRunId}-member-x@example.com`;
+    const parentBEmail = `rls-ci-01-${alRunId}-parent-b@example.com`;
+
+    for (const [email, assign] of [
+      [parentAEmail, (id: string) => (parentAId = id)],
+      [memberXEmail, (id: string) => (memberXId = id)],
+      [parentBEmail, (id: string) => (parentBId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parentA = await signInClient(parentAEmail);
+    memberX = await signInClient(memberXEmail);
+    parentB = await signInClient(parentBEmail);
+
+    const { data: parentAMember, error: pErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentAId)
+      .single();
+    if (pErr) throw pErr;
+    householdAId = parentAMember.household_id as string;
+
+    // Member X joins household A as a non-Parent.
+    const { error: reassignErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdAId, role: "member" })
+      .eq("auth_user_id", memberXId);
+    if (reassignErr) throw reassignErr;
+
+    // A Parent-A write that fires trg_audit_category → one audit_log_entry
+    // row whose household_member_id resolves to household A.
+    const { data: cat, error: catErr } = await parentA.rpc("rpc_upsert_category", {
+      p_household_id: householdAId,
+      p_name: `Audit Log Cat ${alRunId}`,
+    });
+    if (catErr) throw catErr;
+    categoryId = cat as string;
+  });
+
+  afterAll(async () => {
+    for (const id of [parentAId, memberXId, parentBId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("a Parent can read their own household's audit_log_entry rows", async () => {
+    const { data, error } = await parentA
+      .from("audit_log_entry")
+      .select("*")
+      .eq("entity_type", "category")
+      .eq("entity_id", categoryId);
+    expect(error).toBeNull();
+    expect((data ?? []).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a non-Parent Member of the same household is denied (audit_log_read is Parent-only)", async () => {
+    const { data, error } = await memberX
+      .from("audit_log_entry")
+      .select("*")
+      .eq("entity_id", categoryId);
+    expect(error).toBeNull();
+    expect(data ?? []).toHaveLength(0);
+  });
+
+  it("a Parent of a different household cannot read the first household's audit_log_entry rows", async () => {
+    const { data, error } = await parentB
+      .from("audit_log_entry")
+      .select("*")
+      .eq("entity_id", categoryId);
+    expect(error).toBeNull();
+    expect(data ?? []).toHaveLength(0);
+  });
+
+  it("an unauthenticated client's direct read of audit_log_entry is denied", async () => {
+    const { data } = await anon
+      .from("audit_log_entry")
+      .select("*")
+      .eq("entity_id", categoryId);
+    // Outcome, not mechanism (item 7): no rows leak, error or not.
+    expect(data ?? []).toHaveLength(0);
+  });
+});
