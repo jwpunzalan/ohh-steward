@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import { AppState } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import { Button, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import {
+  Button,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
 import { useFonts } from "expo-font";
 import {
   Nunito_700Bold,
@@ -42,7 +51,8 @@ type Screen =
   | "create-account"
   | "create-transaction"
   | "transaction-list"
-  | "account-detail";
+  | "account-detail"
+  | "budget-settings";
 type PeriodType = "monthly" | "biweekly";
 type InviteRole = "parent" | "member";
 type AccountType = "account" | "savings" | "savings_goal" | "credit_card";
@@ -100,6 +110,16 @@ type DetailTxn = {
   date: string;
   store: string | null;
 };
+// Story 7.1.G2 — Budget settings (period type / currency / surplus destination).
+type BudgetSettings = {
+  id: string;
+  name: string;
+  period_type: PeriodType;
+  default_currency: string | null;
+  surplus_destination_id: string | null;
+};
+type CurrencyOption = { code: string; name: string };
+type SurplusAccount = { id: string; name: string; type: string };
 
 const DAY_MS = 86_400_000;
 
@@ -258,6 +278,13 @@ export default function App() {
   const [editCreditLimit, setEditCreditLimit] = useState("");
   const [editDueDate, setEditDueDate] = useState("");
   const [editMinPayment, setEditMinPayment] = useState("");
+  // Story 7.1.G2 — Budget settings screen state.
+  const [bsBudget, setBsBudget] = useState<BudgetSettings | null>(null);
+  const [bsCurrencies, setBsCurrencies] = useState<CurrencyOption[]>([]);
+  const [bsAccounts, setBsAccounts] = useState<SurplusAccount[]>([]);
+  const [bsPeriodType, setBsPeriodType] = useState<PeriodType>("monthly");
+  const [bsCurrency, setBsCurrency] = useState("");
+  const [bsSurplusId, setBsSurplusId] = useState<string | null>(null);
 
   // Cold start: the in-memory Supabase client has no session yet
   // (persistSession is false — see lib/supabase.ts). Run the idle-timer +
@@ -741,6 +768,88 @@ export default function App() {
 
     setSubmitting(false);
     await loadAccountDetail(detailAccount.id);
+  }
+
+  // Story 7.1.G2 — load one Budget's settings + the two dropdown data sources.
+  // Read path: no idle guard (matches loadAccountDetail).
+  async function loadBudgetSettings(budgetId: string) {
+    const { data: b, error: bErr } = await supabase
+      .from("budget")
+      .select("id, name, period_type, default_currency, surplus_destination_id")
+      .eq("id", budgetId)
+      .single();
+    if (bErr || !b) {
+      setError("We couldn't load this budget's settings.");
+      return;
+    }
+    const bs = b as BudgetSettings;
+    setBsBudget(bs);
+    setBsPeriodType(bs.period_type);
+    setBsCurrency(bs.default_currency ?? "");
+    setBsSurplusId(bs.surplus_destination_id ?? null);
+
+    const { data: currencyRows } = await supabase
+      .from("currency")
+      .select("code, name")
+      .order("name");
+    setBsCurrencies((currencyRows as CurrencyOption[]) ?? []);
+
+    // AC4: only this Budget's own accounts — not archived, not soft-deleted,
+    // not credit_card. The DB trigger stays the real boundary (AC5).
+    const { data: acctRows } = await supabase
+      .from("account")
+      .select("id, name, type")
+      .eq("budget_id", budgetId)
+      .eq("is_deleted", false)
+      .eq("is_archived", false)
+      .neq("type", "credit_card")
+      .order("name");
+    setBsAccounts((acctRows as SurplusAccount[]) ?? []);
+  }
+
+  async function handleSaveBudgetSettings() {
+    if (!bsBudget) return;
+    setSubmitting(true);
+    setError(null);
+    // STEW-37: enforce the idle timeout before any network call (write path).
+    const timeoutMinutes = await getCachedSessionTimeoutMinutes();
+    if (!(await guardIdleOrSignOut(timeoutMinutes))) {
+      setSubmitting(false);
+      setScreen("auth");
+      return;
+    }
+
+    // Closed-set check before the write (obligation 2); the FK is the real
+    // boundary. An empty code clears the column (it is nullable).
+    const trimmedCurrency = bsCurrency.trim().toUpperCase();
+    if (
+      trimmedCurrency &&
+      !bsCurrencies.some((c) => c.code === trimmedCurrency)
+    ) {
+      setError("That currency code isn't recognised.");
+      setSubmitting(false);
+      return;
+    }
+
+    const { error: updateError } = await supabase
+      .from("budget")
+      .update({
+        period_type: bsPeriodType,
+        default_currency: trimmedCurrency || null,
+        surplus_destination_id: bsSurplusId || null,
+      })
+      .eq("id", bsBudget.id);
+
+    if (updateError) {
+      // Generic message only (obligation 10) — never the RLS denial or the
+      // trigger/constraint rejection text verbatim.
+      setError("We couldn't save those changes. Please try again.");
+      setSubmitting(false);
+      return;
+    }
+
+    setSubmitting(false);
+    await loadBudgetSettings(bsBudget.id);
   }
 
   async function handleCreateAccount() {
@@ -1781,6 +1890,22 @@ export default function App() {
           </Text>
         </Pressable>
 
+        {/* Story 7.1.G2 — Budget settings entry point; shown once a Budget is
+            selected. Carries the dashboard's selected-Budget id (dashBudgetId)
+            without disturbing dashboard state, following the account-detail
+            precedent. */}
+        {dashBudgetId ? (
+          <Pressable
+            onPress={() => {
+              setError(null);
+              loadBudgetSettings(dashBudgetId);
+              setScreen("budget-settings");
+            }}
+          >
+            <Text style={styles.link}>Budget settings</Text>
+          </Pressable>
+        ) : null}
+
         {/* AC1: Period picker with historical navigation — index moves over the
             already-loaded, newest-first array; no query per click. */}
         <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
@@ -2061,6 +2186,84 @@ export default function App() {
 
         <StatusBar style="auto" />
       </View>
+    );
+  }
+
+  if (screen === "budget-settings") {
+    // Cycle [None, ...accounts] for the surplus destination (Expo has no
+    // native <select>; same tap-to-change pattern the other pickers use).
+    const surplusChoices: (SurplusAccount | null)[] = [null, ...bsAccounts];
+    const surplusLabel =
+      bsAccounts.find((a) => a.id === bsSurplusId)?.name ?? "None";
+    const currencyName = bsCurrencies.find(
+      (c) => c.code === bsCurrency.trim().toUpperCase(),
+    )?.name;
+    return (
+      <KeyboardAvoidingView
+        style={styles.container}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+      >
+        <Text style={styles.title}>
+          Budget settings{bsBudget ? `: ${bsBudget.name}` : ""}
+        </Text>
+
+        <Pressable
+          onPress={() =>
+            setBsPeriodType(bsPeriodType === "monthly" ? "biweekly" : "monthly")
+          }
+        >
+          <Text style={styles.link}>
+            Period: {bsPeriodType} (tap to change)
+          </Text>
+        </Pressable>
+
+        <TextInput
+          style={styles.input}
+          placeholder="Currency (3-letter code, blank to clear)"
+          value={bsCurrency}
+          onChangeText={(text) => setBsCurrency(text.toUpperCase())}
+          maxLength={3}
+          autoCapitalize="characters"
+        />
+        {currencyName ? (
+          <Text style={{ color: "#666" }}>{currencyName}</Text>
+        ) : null}
+
+        <Pressable
+          onPress={() => {
+            if (surplusChoices.length <= 1) return;
+            const idx = surplusChoices.findIndex(
+              (c) => (c?.id ?? null) === bsSurplusId,
+            );
+            const next = surplusChoices[(idx + 1) % surplusChoices.length];
+            setBsSurplusId(next?.id ?? null);
+          }}
+        >
+          <Text style={styles.link}>
+            Surplus destination: {surplusLabel} (tap to change)
+          </Text>
+        </Pressable>
+
+        {error && <Text style={styles.error}>{error}</Text>}
+
+        <Button
+          title={submitting ? "Saving…" : "Save changes"}
+          onPress={handleSaveBudgetSettings}
+          disabled={submitting || !bsBudget}
+        />
+
+        <Pressable
+          onPress={() => {
+            setError(null);
+            setBsBudget(null);
+            setScreen("dashboard");
+          }}
+        >
+          <Text style={styles.link}>Back to dashboard</Text>
+        </Pressable>
+
+        <StatusBar style="auto" />
+      </KeyboardAvoidingView>
     );
   }
 
