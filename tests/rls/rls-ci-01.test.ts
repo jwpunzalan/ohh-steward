@@ -2538,3 +2538,170 @@ describe("RLS-CI-01: household direct-write constraints", () => {
     expect(await caps()).toEqual(before);
   });
 });
+
+/**
+ * DIP-7.1.G2 (Story 7.1.G2) — the new Budget settings screens (web + mobile)
+ * write budget.surplus_destination_id via a plain, RLS-governed .update()
+ * (no RPC). Instruction 7 asks for three committed cases proving
+ * trg_budget_validate_surplus_destination is the real enforcement boundary
+ * behind the client-side dropdown narrowing (AC4/AC5), exercised through a
+ * Budget owner's own direct .update(). (This overlaps the existing
+ * "envelope surplus transfer" AC6 coverage; kept as its own block per the
+ * instruction, framed around this story's write path.)
+ */
+describe("RLS-CI-01: budget settings surplus-destination validation (7.1.G2)", () => {
+  const admin = adminClient();
+  const bsRunId = `${runId}-budget-settings`;
+
+  let parentId: string;
+  let ownerId: string;
+
+  let householdId: string;
+  let budgetOwnedId: string; // owned by `owner`, holds the accounts below
+  let budgetOtherId: string; // a different Budget in the same household
+  let savingsSameBudgetId: string; // valid destination
+  let creditCardSameBudgetId: string; // rejected: credit_card type
+  let accountOtherBudgetId: string; // rejected: different Budget
+
+  let parent: SupabaseClient;
+  let owner: SupabaseClient;
+
+  const surplusOf = async () => {
+    const { data } = await admin
+      .from("budget")
+      .select("surplus_destination_id")
+      .eq("id", budgetOwnedId)
+      .single();
+    return data?.surplus_destination_id ?? null;
+  };
+
+  beforeAll(async () => {
+    const parentEmail = `rls-ci-01-${bsRunId}-parent@example.com`;
+    const ownerEmail = `rls-ci-01-${bsRunId}-owner@example.com`;
+
+    for (const [email, assign] of [
+      [parentEmail, (id: string) => (parentId = id)],
+      [ownerEmail, (id: string) => (ownerId = id)],
+    ] as const) {
+      const { data, error } = await admin.auth.admin.createUser({
+        email,
+        password: TEST_PASSWORD,
+        email_confirm: true,
+      });
+      if (error) throw error;
+      assign(data.user.id);
+    }
+
+    parent = await signInClient(parentEmail);
+    owner = await signInClient(ownerEmail);
+
+    const { data: parentMember, error: pErr } = await admin
+      .from("household_member")
+      .select("household_id")
+      .eq("auth_user_id", parentId)
+      .single();
+    if (pErr) throw pErr;
+    householdId = parentMember.household_id as string;
+
+    const { data: ownerRows, error: oErr } = await admin
+      .from("household_member")
+      .update({ household_id: householdId, role: "member" })
+      .eq("auth_user_id", ownerId)
+      .select("id");
+    if (oErr) throw oErr;
+    const ownerMemberId = ownerRows![0].id as string;
+
+    const { data: bOwned, error: bOwnedErr } = await owner.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 Budget Settings Owned",
+        p_period_type: "monthly",
+        p_owner_member_ids: [ownerMemberId],
+      },
+    );
+    if (bOwnedErr) throw bOwnedErr;
+    budgetOwnedId = bOwned as string;
+
+    const { data: bOther, error: bOtherErr } = await parent.rpc(
+      "rpc_create_budget",
+      {
+        p_name: "RLS-CI-01 Budget Settings Other",
+        p_period_type: "monthly",
+        p_owner_member_ids: [],
+      },
+    );
+    if (bOtherErr) throw bOtherErr;
+    budgetOtherId = bOther as string;
+
+    const mkAccount = async (
+      client: SupabaseClient,
+      budgetId: string,
+      name: string,
+      type: string,
+      extra: Record<string, unknown> = {},
+    ) => {
+      const { data, error } = await client.rpc("rpc_create_account", {
+        p_budget_id: budgetId,
+        p_type: type,
+        p_name: name,
+        p_currency: "USD",
+        p_opening_balance: 0,
+        ...extra,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+    savingsSameBudgetId = await mkAccount(
+      owner,
+      budgetOwnedId,
+      "Owned Savings",
+      "savings",
+    );
+    creditCardSameBudgetId = await mkAccount(
+      owner,
+      budgetOwnedId,
+      "Owned Card",
+      "credit_card",
+      { p_credit_limit: 1000 },
+    );
+    accountOtherBudgetId = await mkAccount(
+      parent,
+      budgetOtherId,
+      "Other Checking",
+      "account",
+    );
+  });
+
+  afterAll(async () => {
+    for (const id of [parentId, ownerId]) {
+      if (id) await admin.auth.admin.deleteUser(id).catch(() => {});
+    }
+  });
+
+  it("AC5: a Budget owner's direct .update() setting surplus_destination_id to a credit_card account is rejected", async () => {
+    const { error } = await owner
+      .from("budget")
+      .update({ surplus_destination_id: creditCardSameBudgetId })
+      .eq("id", budgetOwnedId);
+    expect(error).not.toBeNull();
+    expect(await surplusOf()).toBeNull();
+  });
+
+  it("AC5: a Budget owner's direct .update() setting surplus_destination_id to an account from a different Budget is rejected", async () => {
+    const { error } = await owner
+      .from("budget")
+      .update({ surplus_destination_id: accountOtherBudgetId })
+      .eq("id", budgetOwnedId);
+    expect(error).not.toBeNull();
+    expect(await surplusOf()).toBeNull();
+  });
+
+  it("a Budget owner's direct .update() setting surplus_destination_id to a valid same-Budget non-credit-card account succeeds", async () => {
+    const { error } = await owner
+      .from("budget")
+      .update({ surplus_destination_id: savingsSameBudgetId })
+      .eq("id", budgetOwnedId);
+    expect(error).toBeNull();
+    expect(await surplusOf()).toBe(savingsSameBudgetId);
+  });
+});

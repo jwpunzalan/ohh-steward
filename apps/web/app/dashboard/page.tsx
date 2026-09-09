@@ -485,6 +485,17 @@ export default function DashboardPage() {
           ))}
         </select>
 
+        {/* Story 7.1.G2 — the only route to a specific Budget's settings;
+            shown once a Budget is selected. */}
+        {budgetId && (
+          <Link
+            href={`/dashboard/budgets/${budgetId}`}
+            style={{ fontSize: "0.9rem", color: "var(--color-primary-dark)" }}
+          >
+            Settings
+          </Link>
+        )}
+
         <div
           style={{
             display: "flex",
