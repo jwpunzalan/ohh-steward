@@ -90,6 +90,21 @@ function TagIcon() {
     </svg>
   );
 }
+function ChartIcon() {
+  return (
+    <svg {...ic()}>
+      <path d="M4 20V4M4 20h16M8 16v-4M13 16V8M18 16v-7" />
+    </svg>
+  );
+}
+function ClipboardIcon() {
+  return (
+    <svg {...ic()}>
+      <rect x="6" y="4" width="12" height="17" rx="2" />
+      <path d="M9 4V3h6v1M9 10h6M9 14h6M9 18h4" />
+    </svg>
+  );
+}
 
 type NavItem = { href: string; label: string; icon: ReactNode };
 
@@ -112,6 +127,8 @@ const SETUP: NavItem[] = [
   { href: "/dashboard/invites/new", label: "Invite", icon: <UserPlusIcon /> },
   { href: "/dashboard/security", label: "Security", icon: <ShieldIcon /> },
   { href: "/dashboard/account", label: "Account", icon: <UserIcon /> },
+  { href: "/dashboard/reports", label: "Reports", icon: <ChartIcon /> },
+  { href: "/dashboard/audit-log", label: "Audit Log", icon: <ClipboardIcon /> },
 ];
 const ALL_ITEMS = [...CORE, ...SETUP];
 
